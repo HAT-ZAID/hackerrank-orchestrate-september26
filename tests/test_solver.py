@@ -190,34 +190,30 @@ def test_installment_deadline_filter_both_modes(monkeypatch):
 
 def test_spending_fallback_when_all_viable_miss_deadline(monkeypatch):
     # Full viable (safe>=req) but completion req_date 2026-02-01 misses deadline 2026-01-15.
-    # Viable non-empty but all miss => must still try spending changes.
+    # Task 4: the deadline is a hard filter, so the change search still runs and
+    # the late plans are not candidates at all.
     import code.solver as sm
     def fake_safe(*a, **k):
         return {"safe_amount": Decimal("5000"), "earliest_date": "2026-02-01", "ledger": []}
     monkeypatch.setattr(sm, "solve_safe_amount", fake_safe)
     seen = {}
-    def fake_search(*a, **k):
+    def fake_sets(*a, **k):
         seen["called"] = True
-        return ["stop:event_x"]
-    monkeypatch.setattr(sm, "search_changes", fake_search)
-    # Second oracle call after changes must stay safe so fallback succeeds.
-    orig_fake = fake_safe
-    calls = {"n": 0}
-    def fake_safe2(*a, **k):
-        calls["n"] += 1
-        return {"safe_amount": Decimal("5000"), "earliest_date": "2026-02-01", "ledger": []}
-    monkeypatch.setattr(sm, "solve_safe_amount", fake_safe2)
+        return [[{"event_id": "event_x", "action": "stop", "value": Decimal("0"),
+                  "category": "dining", "savings": Decimal("4000")}]]
+    monkeypatch.setattr(sm, "build_change_sets", fake_sets)
     prof = _profile("full_payment")
     res = solve_request("r1", "u1", "2026-02-01", "5000", prof,
                         [{"event_id": "event_x"}], [], _empty_options(), None, "2026-01-15", False)
-    assert seen.get("called") is True, f"fallback search must trigger when all viable miss deadline, got {res}"
-    # Both the unchanged and changed full-payment plans miss the already-past
-    # deadline; the specification's no-change tie-breaker keeps the unchanged plan.
+    assert seen.get("called") is True, f"change search must run when no plan meets the deadline, got {res}"
+    # Every candidate (changed or not) completes after the past deadline, so no
+    # plan survives the filter and no change is recommended.
     assert res["spending_changes_needed"] == "none", f"got {res}"
+    assert res["affordability_status"] == "not_affordable", f"got {res}"
 
 
 def test_solver_threads_recurrence_flags(monkeypatch):
-    # Solver must pass real recurrence_flags (not empty set) into search_changes.
+    # Solver must pass real recurrence_flags (not empty set) into the change search.
     import code.solver as sm
     def fake_safe(*a, **k):
         # First call (base) unsafe, second (after changes) safe.
@@ -228,15 +224,17 @@ def test_solver_threads_recurrence_flags(monkeypatch):
     fake_safe.n = 0
     monkeypatch.setattr(sm, "solve_safe_amount", fake_safe)
     captured = {}
-    def fake_search(uid, rdate, ramt, prof, evts, fx, recurrence_flags=None, **_kwargs):
+    def fake_sets(uid, prof, evts, recurrence_flags=None, **_kwargs):
         captured["flags"] = recurrence_flags
-        return ["stop:event_x"]
-    monkeypatch.setattr(sm, "search_changes", fake_search)
+        return [[{"event_id": "event_x", "action": "stop", "value": Decimal("0"),
+                  "category": "dining", "savings": Decimal("4000")}]]
+    monkeypatch.setattr(sm, "build_change_sets", fake_sets)
     monkeypatch.setattr(sm, "detect_recurrence", lambda evts: {("u1", "dining", "expense")})
     prof = _profile("full_payment")
     res = solve_request("r1", "u1", "2026-01-01", "5000", prof,
                         [], [], _empty_options(), None, None, False)
     assert captured.get("flags") == {("u1", "dining", "expense")}, f"must thread real flags, got {captured}"
+    assert res["spending_changes_needed"] == "stop:event_x", f"got {res}"
 
 
 def _salary_profile():
@@ -336,23 +334,27 @@ def test_parser_indonesian_grouping_via_amounts():
 
 
 def test_spending_fallback_earliest_is_original(monkeypatch):
-    # Spending fallback must return original oracle earliest (2026-02-15), not req_date.
-    # Deadline 2026-01-10 blocks wait (earliest 2026-02-15 misses), forcing fallback.
+    # A spending change must return the original oracle earliest (2026-02-15) and
+    # the original safe amount, never the changed re-run values.
+    # Deadline 2026-01-10 blocks wait (earliest 2026-02-15 misses), forcing the change.
     import code.solver as sm
     calls = {"n": 0}
     def fake_safe(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
             return {"safe_amount": Decimal("100"), "earliest_date": "2026-02-15", "ledger": []}
-        return {"safe_amount": Decimal("5000"), "earliest_date": "2026-02-15", "ledger": []}
+        return {"safe_amount": Decimal("5000"), "earliest_date": "2026-01-05", "ledger": []}
     monkeypatch.setattr(sm, "solve_safe_amount", fake_safe)
-    monkeypatch.setattr(sm, "search_changes", lambda *a, **k: ["stop:event_x"])
+    monkeypatch.setattr(sm, "build_change_sets", lambda *a, **k: [[
+        {"event_id": "event_x", "action": "stop", "value": Decimal("0"),
+         "category": "dining", "savings": Decimal("4000")}]])
     prof = _profile("full_payment")
     res2 = solve_request("r1", "u1", "2026-01-01", "5000", prof,
                          [{"event_id": "event_x"}], [], _empty_options(), None, "2026-01-10", False)
     assert res2["affordability_status"] == "affordable_with_plan"
     assert res2["spending_changes_needed"] == "stop:event_x"
     assert res2["earliest_date_for_full_payment"] == "2026-02-15", f"got {res2}"
+    assert res2["amount_safe_to_pay"] == "100", f"got {res2}"
 
 
 def _parser_df(text):

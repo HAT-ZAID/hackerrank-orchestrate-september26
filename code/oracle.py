@@ -144,9 +144,17 @@ def solve_safe_amount(
     recurrence_flags: set[tuple[str, str, str]],
     suppressed_categories: set[str] | None = None,
     *,
+    category_overrides: dict[str, object] | None = None,
     evidence_flags: set[str] | list[str] | None = None,
     expense_facts: list[dict] | None = None,
 ) -> dict:
+    """Recompute the 91-day ledger for one plan state.
+
+    ``suppressed_categories`` removes a category's forward forecast (a ``stop``
+    spending change).  ``category_overrides`` sets a category's forward
+    run-rate to an exact amount without removing it (a ``reduce_to`` change).
+    Both are keyword-only policy inputs so existing callers are unchanged.
+    """
     req_date = date.fromisoformat(request_date_str)
 
     try:
@@ -274,6 +282,7 @@ def solve_safe_amount(
         recurrence_flags=recurrence_flags,
         suppressed_categories=suppressed,
         protected_categories=protected_cats,
+        category_overrides=category_overrides,
         evidence_flags=evidence_flags,
         expense_facts=expense_facts,
     )

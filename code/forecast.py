@@ -342,8 +342,10 @@ def _expense_forecast(
     suppressed: set[str],
     protected: set[str],
     warnings: list[dict],
+    overrides: dict[str, Decimal] | None = None,
 ) -> list[ForecastEntry]:
     flags = _normalized_flags(recurrence_flags)
+    overrides = overrides or {}
     history = _expense_history(
         events,
         req_date,
@@ -397,6 +399,10 @@ def _expense_forecast(
         if interval <= 0:
             interval = DEFAULT_INTERVAL_DAYS
         amount = -abs(_median_decimal(bucket["amounts"]))
+        # A `reduce_to` spending change replaces the projected run-rate with the
+        # new amount; the category stays in the forecast (no suppression).
+        if category in overrides:
+            amount = -abs(overrides[category])
         next_date = max(dates) + timedelta(days=interval)
         while next_date < req_date:
             next_date += timedelta(days=interval)
@@ -491,7 +497,9 @@ def _essential_variable_reserve(
     the same category.  Reserve rows post at the bucket start, so the ledger sees
     the outflow conservatively early.  An ended-expense fact suppresses reserve
     buckets on/after its effective date.  ``skipped_categories`` mirrors the
-    unprotected suppressions applied by the direct forecast.
+    unprotected suppressions applied by the direct forecast, plus categories
+    whose forward run-rate a ``reduce_to`` change already fixed exactly (that
+    override *is* the committed spend, so no median top-up applies).
     """
     skipped = {_norm(category) for category in (skipped_categories or ()) if _norm(category)}
     history = _essential_variable_history(
@@ -934,6 +942,7 @@ def build_forecast(
     recurrence_flags=None,
     suppressed_categories=None,
     protected_categories=None,
+    category_overrides=None,
     evidence_flags=None,
     expense_facts=None,
 ) -> ForecastResult:
@@ -942,6 +951,13 @@ def build_forecast(
     ``events`` is expected to be the user's normalized event rows (the oracle
     filters and dedups before calling).  Every policy input is explicit so the
     result is reproducible and unit-testable without pandas.
+
+    ``category_overrides`` maps a category to the forward amount a permitted
+    ``reduce_to`` spending change sets: the category keeps recurring, at exactly
+    that amount, instead of at its historical median (and instead of being
+    suppressed like a ``stop``).  The essential-variable reserve is skipped for
+    an overridden category that actually has forward entries, because the
+    override *is* its committed run-rate.
     """
     request_day = _as_date(req_date)
     if request_day is None:
@@ -959,6 +975,12 @@ def build_forecast(
     window_end = request_day + timedelta(days=HORIZON_DAYS)
     suppressed = {_norm(category) for category in (suppressed_categories or ()) if _norm(category)}
     protected = {_norm(category) for category in (protected_categories or ()) if _norm(category)}
+    overrides: dict[str, Decimal] = {}
+    for category, value in dict(category_overrides or {}).items():
+        name = _norm(category)
+        amount = _decimal(value)
+        if name and amount is not None and amount >= 0:
+            overrides[name] = abs(amount)
 
     warnings: list[dict] = []
     expense_entries = _expense_forecast(
@@ -972,6 +994,7 @@ def build_forecast(
         suppressed=suppressed,
         protected=protected,
         warnings=warnings,
+        overrides=overrides,
     )
     expense_entries = _apply_expense_facts(
         expense_entries,
@@ -981,6 +1004,9 @@ def build_forecast(
         fx_rows=fx_rows,
         warnings=warnings,
     )
+    overridden_with_entries = {
+        entry.category for entry in expense_entries if entry.category in overrides
+    }
     expense_entries = expense_entries + _essential_variable_reserve(
         events,
         request_day,
@@ -990,7 +1016,7 @@ def build_forecast(
         covered_entries=expense_entries,
         expense_facts=expense_facts,
         warnings=warnings,
-        skipped_categories=suppressed - protected,
+        skipped_categories=(suppressed - protected) | overridden_with_entries,
     )
     income_entries, income_stream = _income_forecast(
         events,

@@ -15,13 +15,34 @@ def test_total_cost_primary():
     assert rank_options(opts)[0]["id"] == "opt2"
 
 
-def test_completion_date_tiebreaker():
+def test_completion_date_is_a_filter_not_a_sort_key():
+    # Task 4: deadline feasibility is a hard filter, so completion date no longer
+    # outranks cost/start/legs. With every other key tied, the option id decides.
     opts = [
         {"id": "opt1", "total_cost": Decimal("100"), "completion_date": "2026-01-10", "changes": 0, "legs": 1, "start_date": "2026-01-01"},
         {"id": "opt2", "total_cost": Decimal("100"), "completion_date": "2026-01-05", "changes": 0, "legs": 1, "start_date": "2026-01-01"},
     ]
-    # opt2 is earlier
-    assert rank_options(opts)[0]["id"] == "opt2"
+    assert [o["id"] for o in rank_options(opts)] == ["opt1", "opt2"]
+
+
+def test_late_plan_is_filtered_even_when_it_is_cheaper():
+    # Task 4 brief #4: a plan completing after desired_completion_date is not a
+    # candidate at all; it is never ranked last.
+    opts = [
+        {"id": "opt_cheap_late", "total_cost": Decimal("90"), "completion_date": "2026-02-01", "changes": 0, "legs": 1, "start_date": "2026-01-01"},
+        {"id": "opt_pricey_ontime", "total_cost": Decimal("100"), "completion_date": "2026-01-10", "changes": 0, "legs": 1, "start_date": "2026-01-01"},
+    ]
+    assert [o["id"] for o in rank_options(opts, "2026-01-15")] == ["opt_pricey_ontime"]
+    # A deadline on the completion date itself is still feasible.
+    assert [o["id"] for o in rank_options(opts, "2026-02-01")] == [
+        "opt_cheap_late",
+        "opt_pricey_ontime",
+    ]
+    # No survivor means no candidate, never a late consolation plan.
+    assert rank_options([opts[0]], "2026-01-15") == []
+    # A missing/NaN deadline is no constraint (existing solver contract).
+    for blank in (None, "", "nan", float("nan")):
+        assert len(rank_options(opts, blank)) == 2
 
 
 def test_num_changes_tiebreaker():
@@ -61,12 +82,13 @@ def test_option_id_final_tiebreaker():
 
 
 def test_deadline_beats_total_cost():
-    # Spec Choosing #1 > #3: on-time expensive beats late cheap.
+    # Spec Choosing #1 > #3: on-time expensive beats late cheap. Task 4 makes
+    # rule #1 a hard filter, so the deadline is passed explicitly.
     opts = [
         {"id": "opt_cheap_late", "total_cost": Decimal("90"), "completion_date": "2026-02-01", "changes": 0, "legs": 1, "start_date": "2026-01-01"},
         {"id": "opt_expensive_ontime", "total_cost": Decimal("100"), "completion_date": "2026-01-05", "changes": 0, "legs": 1, "start_date": "2026-01-01"},
     ]
-    assert rank_options(opts)[0]["id"] == "opt_expensive_ontime"
+    assert rank_options(opts, "2026-01-15")[0]["id"] == "opt_expensive_ontime"
 
 
 def test_no_changes_beats_total_cost():

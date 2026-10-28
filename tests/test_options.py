@@ -65,3 +65,34 @@ def test_build_payment_plan_dates_byte_match():
     opt = {"payment_method": "installments", "payment_amount": "100",
            "number_of_payments": 3, "payment_frequency_days": 30}
     assert _build_payment_plan(opt, "2026-01-01") == "2026-01-01:100|2026-01-31:100|2026-03-02:100"
+
+
+def _single_inst(n, freq, total, *, amount="100", max_months="1"):
+    rows = [{
+        "payment_option_id": "opt_inst", "request_id": "r1", "payment_method": "installments",
+        "payment_amount": amount, "number_of_payments": n, "first_payment_date": "2026-01-01",
+        "payment_frequency_days": freq, "financing_fee": 0, "total_payable_amount": total,
+    }]
+    return get_valid_options("r1", _profile(max_months), _df(rows))
+
+
+def test_plan_just_over_max_installment_months_is_rejected():
+    # Task 4 brief #5/#6: flooring total_days // 30 hid a 45-day plan at max 1
+    # month (45//30 == 1). The exact comparison must reject it.
+    assert _single_inst(3, 15, "300", max_months="1") == []
+    # A 30-day schedule is inside a two-month limit (exact comparison).
+    accepted = _single_inst(2, 15, "200", max_months="2")
+    assert [o["option_id"] for o in accepted] == ["opt_inst"]
+    assert accepted[0]["completion_date"] == "2026-01-16"
+    # The payment-count reading is enforced too: three payments cannot be sold as
+    # a two-month plan even at a 10-day frequency.
+    assert _single_inst(3, 10, "300", max_months="2") == []
+
+
+def test_inconsistent_total_payable_row_is_rejected():
+    # A supplied row whose legs do not add up to total_payable_amount is
+    # inconsistent evidence: reject it fail-closed instead of emitting a plan.
+    n, amount, total = 3, Decimal("100"), Decimal("250")
+    assert _single_inst(n, 30, str(total), amount=str(amount), max_months="12") == []
+    assert _single_inst(n, 30, str(amount * n), amount=str(amount), max_months="12")
+

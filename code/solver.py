@@ -1,11 +1,15 @@
-"""P3 Full Solver: Integrates Oracle, Ranking, and Payment Options to make the final decision.
+"""P3 Full Solver: plan candidates + the single ranking authority.
 
-Launder Logic:
-1. Process Messages/Images to update profiles and events.
-2. Identify all viable payment options (Full, Partial, Installments, Wait).
-3. For each option, use the Oracle to check safety.
-4. Rank the safe options using Ranking logic (code/ranking.py).
-5. Pick the best.
+Launder logic:
+1. Process Messages/Images into typed facts and apply them to the oracle copy.
+2. Ask the oracle for the base (no optional spending change) cashflow.
+3. Build every plan shape (full, partial, installments, wait) from that base
+   state; when no base plan meets the deadline, repeat for a bounded set of
+   permitted spending-change sets, each recomputed from its own cashflow.
+4. Rank the combined pool with :func:`code.ranking.rank_options` and return the
+   winner.  ``amount_safe_to_pay`` and ``earliest_date_for_full_payment`` always
+   stay the base oracle values; only status, method, plan and the emitted change
+   list come from the winning candidate.
 """
 from __future__ import annotations
 
@@ -14,7 +18,8 @@ from datetime import date, timedelta
 from decimal import Decimal
 from code.oracle import solve_safe_amount
 from code.options import get_valid_options
-from code.changes import search_changes
+from code.changes import apply_changes, build_change_sets, describe_action
+from code.ranking import parse_deadline, rank_options
 from code.recurrence import detect_recurrence
 from code.parser import parse_messages
 from code.reconcile import reconcile_events
@@ -298,29 +303,132 @@ def _installment_safe(ledger, req_date_str: str, payment_plan: str, profile: dic
     return True
 
 
-def _parse_deadline_date(val) -> date | None:
-    try:
-        if val is None:
-            return None
-        if isinstance(val, float) and val != val:  # NaN
-            return None
-        s = str(val).strip()
-        if not s or s.lower() in ("nan", "none", "null", "nat", "n/a", "na"):
-            return None
-        return date.fromisoformat(s)
-    except Exception:
-        return None
-
-
 def meets_deadline(comp_date, desired_completion_date) -> bool:
     """Deadline check with NaN/'' normalization (missing/NaN = no constraint)."""
-    desired = _parse_deadline_date(desired_completion_date)
+    desired = parse_deadline(desired_completion_date)
     if desired is None:
         return True
-    comp = _parse_deadline_date(comp_date)
+    comp = parse_deadline(comp_date)
     if comp is None:
         return True
     return comp <= desired
+
+
+def _is_iso_date(value) -> bool:
+    try:
+        date.fromisoformat(str(value))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _build_candidates(state: dict, base: dict, ctx: dict) -> list[dict]:
+    """Build every plan shape for one cashflow state (base or changed).
+
+    ``state`` carries the safe amount, earliest full-payment date and ledger
+    recomputed for this state; ``base`` carries the no-optional-change oracle
+    values.  The output contract pins ``amount_safe_to_pay`` and
+    ``earliest_date_for_full_payment`` to the *base* values, so a partial plan
+    is always exactly those two legs (leg 1 on the request date, leg 2 on the
+    base earliest date); only status, method, plan and changes come from the
+    winning candidate.  Deadline feasibility is *not* decided here: ranking is
+    the single authority for it.
+    """
+    request_date = ctx["request_date"]
+    requested = ctx["requested_amount"]
+    will = ctx["will"]
+    profile = ctx["profile"]
+    suffix = state.get("suffix", "")
+    changes = list(state.get("changes") or [])
+    change_count = len(changes)
+    changes_text = "|".join(changes) if changes else "none"
+    safe = state["safe"]
+    earliest = state.get("earliest")
+    ledger = state.get("ledger") or []
+    base_safe = base["safe"]
+    base_earliest = base.get("earliest")
+    candidates: list[dict] = []
+
+    # Option A: full payment on the request date.
+    if safe >= requested and "full_payment" in will:
+        candidates.append({
+            "option_id": f"opt_full_now{suffix}", "id": f"opt_full_now{suffix}",
+            "payment_method": "full_payment",
+            "amount_safe_to_pay": requested,
+            "affordability_status": "affordable_with_plan" if changes else "affordable_now",
+            "payment_plan": f"{request_date}:{requested}",
+            "earliest_date": earliest,
+            "spending_changes": changes_text,
+            "cost": requested, "total_cost": requested,
+            "completion_date": request_date,
+            "changes": change_count, "legs": 1, "start_date": request_date,
+            "num_payments": 1,
+        })
+
+    # Option B: partial payment — the request allows it, the user accepts it,
+    # and the remainder lands on the (base) earliest full-payment date.
+    if (Decimal("0") < base_safe < requested and ctx["allows_partial"]
+            and "partial_payment" in will and _is_iso_date(base_earliest)):
+        remainder = requested - base_safe
+        candidates.append({
+            "option_id": f"opt_partial{suffix}", "id": f"opt_partial{suffix}",
+            "payment_method": "partial_payment",
+            "amount_safe_to_pay": base_safe,
+            "affordability_status": "affordable_with_plan",
+            "payment_plan": f"{request_date}:{base_safe}|{base_earliest}:{remainder}",
+            "earliest_date": base_earliest,
+            "spending_changes": changes_text,
+            "cost": requested, "total_cost": requested,
+            "completion_date": base_earliest,
+            "changes": change_count, "legs": 2, "start_date": request_date,
+            "num_payments": 2,
+        })
+
+    # Option C: installments — exactly a supplied option, certified per leg
+    # against *this* state's ledger.
+    for opt in ctx["installment_options"]:
+        if opt.get("payment_method") != "installments" or "installments" not in will:
+            continue
+        if ctx["strict_installments"] and not _installment_safe(
+            ledger, request_date, opt.get("payment_plan", ""), profile
+        ):
+            continue
+        completion = opt.get("completion_date", opt["first_payment_date"])
+        candidates.append({
+            "option_id": f"{opt['option_id']}{suffix}", "id": f"{opt['option_id']}{suffix}",
+            "payment_method": "installments",
+            "amount_safe_to_pay": base_safe if base_safe < requested else requested,
+            "affordability_status": "affordable_with_plan",
+            "payment_plan": opt["payment_plan"],
+            "earliest_date": earliest,
+            "spending_changes": changes_text,
+            "cost": opt.get("total_payable", opt["amount"]),
+            "total_cost": opt.get("total_payable", opt["amount"]),
+            "completion_date": completion,
+            "changes": change_count, "legs": opt["number_of_payments"],
+            "start_date": opt["first_payment_date"],
+            "num_payments": opt["number_of_payments"],
+        })
+
+    # Option D: wait — one full payment on this state's earliest safe date.
+    if (_is_iso_date(earliest)
+            and date.fromisoformat(str(earliest)) > date.fromisoformat(str(request_date))
+            and "full_payment" in will):
+        candidates.append({
+            "option_id": f"opt_wait{suffix}", "id": f"opt_wait{suffix}",
+            "payment_method": "wait",
+            "amount_safe_to_pay": safe,
+            "affordability_status": "affordable_later",
+            "payment_plan": f"{earliest}:{requested}",
+            "earliest_date": earliest,
+            "spending_changes": changes_text,
+            "cost": requested, "total_cost": requested,
+            "completion_date": earliest,
+            "changes": change_count, "legs": 1, "start_date": earliest,
+            "num_payments": 1,
+        })
+
+    return candidates
 
 
 def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, options_df, messages_df=None, desired_completion_date=None, allows_partial_payment=None, installment_safety="strict"):
@@ -420,258 +528,116 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
     safe_amt = res_now["safe_amount"]
     earliest = res_now["earliest_date"]
 
-    def _meets(comp_date) -> bool:
-        return meets_deadline(comp_date, desired_completion_date)
+    # 3. Build every candidate plan: the no-change state first, then a bounded
+    #    set of permitted change sets, each recomputed against its own cashflow.
+    base_state = {
+        "safe": safe_amt,
+        "earliest": earliest,
+        "ledger": res_now.get("ledger") or [],
+        "changes": [],
+        "suffix": "",
+    }
+    will_set = set(will)
+    strict_inst = installment_safety != "lenient"
+    ctx = {
+        "request_date": req_date,
+        "requested_amount": req_amt_dec,
+        "profile": profile,
+        "will": will_set,
+        "allows_partial": bool(allows_partial),
+        "installment_options": get_valid_options(rid, profile, options_df),
+        "strict_installments": strict_inst,
+    }
+    candidates = _build_candidates(base_state, base_state, ctx)
+    ranked = rank_options(candidates, desired_completion_date)
 
-    def _valid_earliest(val) -> bool:
+    if not ranked:
+        # Spending changes are first-class candidates: they are evaluated
+        # whenever no no-change plan meets the deadline, not merely when the
+        # option pool happens to be empty.  Ranking rule 2 (fewer changes) makes
+        # a feasible no-change plan unbeatable, so skipping the search then
+        # cannot change the winner.  Sizes are tried 1, then 2, then 3, and a
+        # size is only reached when the smaller sizes produced no candidate.
         try:
-            date.fromisoformat(str(val))
-            return True
-        except Exception:
-            return False
-
-    # Build viable options
-    viable_options = []
-
-    # Option A: Full Payment (Now) â€” eligible only if user considers full_payment
-    if safe_amt >= req_amt_dec and "full_payment" in will:
-        viable_options.append({
-            "option_id": "opt_full_now",
-            "id": "opt_full_now",
-            "payment_method": "full_payment",
-            "amount_safe_to_pay": req_amt_dec,
-            "affordability_status": "affordable_now",
-            "payment_plan": f"{req_date}:{req_amt_dec}",
-            "earliest_date": req_date,
-            "spending_changes": "none",
-            "cost": req_amt_dec,
-            "total_cost": req_amt_dec,
-            "completion_date": req_date,
-            "changes": 0,
-            "legs": 1,
-            "start_date": req_date,
-            "num_payments": 1
-        })
-
-    # Option B: Partial Payment â€” only when request allows, user accepts, 0<safe<req, second leg by deadline
-    if Decimal("0") < safe_amt < req_amt_dec and earliest and "partial_payment" in will:
-        partial_ok = True
-        if allows_partial is False:
-            partial_ok = False
-        if not _meets(earliest):
-            partial_ok = False
-        if partial_ok:
-            viable_options.append({
-            "option_id": "opt_partial",
-            "id": "opt_partial",
-            "payment_method": "partial_payment",
-            "amount_safe_to_pay": safe_amt,
-            "affordability_status": "affordable_with_plan",
-            "payment_plan": f"{req_date}:{safe_amt}|{earliest}:{req_amt_dec - safe_amt}",
-            "earliest_date": earliest,
-            "spending_changes": "none",
-            "cost": req_amt_dec,
-            "total_cost": req_amt_dec,
-            "completion_date": earliest,
-            "changes": 0,
-            "legs": 2,
-            "start_date": req_date,
-            "num_payments": 2
-        })
-
-    # Option C: Installments â€” eligible only if user considers installments.
-    # Strict (default): deadline + per-leg ledger safety (post-leg balances >= floor).
-    # Lenient: deadline only (legacy behavior).
-    strict_inst = (installment_safety != "lenient")
-    ledger_now = res_now.get("ledger", [])
-    valid_inst = get_valid_options(rid, profile, options_df)
-    for opt in valid_inst:
-        if opt["payment_method"] == "installments" and "installments" in will:
-            if not _meets(opt.get("completion_date", opt["first_payment_date"])):
-                continue
-            if strict_inst and not _installment_safe(ledger_now, req_date, opt.get("payment_plan", ""), profile):
-                continue
-            viable_options.append({
-                "option_id": opt["option_id"],
-                "id": opt["option_id"],
-                "payment_method": "installments",
-                "amount_safe_to_pay": safe_amt if safe_amt < req_amt_dec else req_amt_dec,
-                "affordability_status": "affordable_with_plan",
-                "payment_plan": opt["payment_plan"],
-                "earliest_date": earliest,
-                "spending_changes": "none",
-                "cost": opt.get("total_payable", opt["amount"]),
-                "total_cost": opt.get("total_payable", opt["amount"]),
-                "completion_date": opt.get("completion_date", opt["first_payment_date"]),
-                "changes": 0,
-                "legs": opt["number_of_payments"],
-                "start_date": opt["first_payment_date"],
-                "num_payments": opt["number_of_payments"]
-            })
-
-    # Option D: Wait â€” eligible when full becomes safe later and user accepts full_payment
-    if earliest and _valid_earliest(earliest) and str(earliest) > str(req_date) and "full_payment" in will and _meets(earliest):
-        viable_options.append({
-            "option_id": "opt_wait",
-            "id": "opt_wait",
-            "payment_method": "wait",
-            "amount_safe_to_pay": safe_amt,
-            "affordability_status": "affordable_later",
-            "payment_plan": f"{earliest}:{req_amt_dec}",
-            "earliest_date": earliest,
-            "spending_changes": "none",
-            "cost": req_amt_dec,
-            "total_cost": req_amt_dec,
-            "completion_date": earliest,
-            "changes": 0,
-            "legs": 1,
-            "start_date": earliest,
-            "num_payments": 1
-        })
-
-    # Spec Â§Choosing: try permitted spending changes when no viable plan,
-    # or when viable exist but ALL miss desired_completion_date.
-    def _append_changed_options(changed_safe, changed_earliest, changed_ledger, changes_text):
-        """Add safe variants to the same pool as no-change options."""
-        change_count = len(changes_text.split("|"))
-        if changed_safe >= req_amt_dec and "full_payment" in will:
-            viable_options.append({
-                "option_id": "opt_full_changed", "id": "opt_full_changed",
-                "payment_method": "full_payment", "amount_safe_to_pay": req_amt_dec,
-                "affordability_status": "affordable_with_plan",
-                "payment_plan": f"{req_date}:{req_amt_dec}", "earliest_date": changed_earliest,
-                "spending_changes": changes_text, "cost": req_amt_dec, "total_cost": req_amt_dec,
-                "completion_date": req_date, "changes": change_count, "legs": 1,
-                "start_date": req_date, "num_payments": 1,
-            })
-        if (Decimal("0") < safe_amt < req_amt_dec and allows_partial and
-                "partial_payment" in will and changed_earliest and _meets(changed_earliest)):
-            viable_options.append({
-                "option_id": "opt_partial_changed", "id": "opt_partial_changed",
-                "payment_method": "partial_payment", "amount_safe_to_pay": safe_amt,
-                "affordability_status": "affordable_with_plan",
-                "payment_plan": f"{req_date}:{safe_amt}|{changed_earliest}:{req_amt_dec - safe_amt}",
-                "earliest_date": changed_earliest, "spending_changes": changes_text,
-                "cost": req_amt_dec, "total_cost": req_amt_dec, "completion_date": changed_earliest,
-                "changes": change_count, "legs": 2, "start_date": req_date, "num_payments": 2,
-            })
-        for opt in valid_inst:
-            if opt["payment_method"] != "installments" or "installments" not in will:
-                continue
-            completion = opt.get("completion_date", opt["first_payment_date"])
-            if not _meets(completion):
-                continue
-            if strict_inst and not _installment_safe(changed_ledger, req_date, opt.get("payment_plan", ""), profile):
-                continue
-            changed_id = f"{opt['option_id']}_changed"
-            viable_options.append({
-                "option_id": changed_id, "id": changed_id, "payment_method": "installments",
-                "amount_safe_to_pay": safe_amt if safe_amt < req_amt_dec else req_amt_dec,
-                "affordability_status": "affordable_with_plan", "payment_plan": opt["payment_plan"],
-                "earliest_date": changed_earliest, "spending_changes": changes_text,
-                "cost": opt.get("total_payable", opt["amount"]),
-                "total_cost": opt.get("total_payable", opt["amount"]), "completion_date": completion,
-                "changes": change_count, "legs": opt["number_of_payments"],
-                "start_date": opt["first_payment_date"], "num_payments": opt["number_of_payments"],
-            })
-        if (changed_earliest and _valid_earliest(changed_earliest) and
-                date.fromisoformat(str(changed_earliest)) > date.fromisoformat(str(req_date)) and
-                "full_payment" in will and _meets(changed_earliest)):
-            viable_options.append({
-                "option_id": "opt_wait_changed", "id": "opt_wait_changed", "payment_method": "wait",
-                "amount_safe_to_pay": safe_amt, "affordability_status": "affordable_later",
-                "payment_plan": f"{changed_earliest}:{req_amt_dec}", "earliest_date": changed_earliest,
-                "spending_changes": changes_text, "cost": req_amt_dec, "total_cost": req_amt_dec,
-                "completion_date": changed_earliest, "changes": change_count, "legs": 1,
-                "start_date": changed_earliest, "num_payments": 1,
-            })
-
-    spending_needed = "none"
-    _all_miss = False
-    if viable_options:
-        try:
-            _desired_present = _parse_deadline_date(desired_completion_date) is not None
-        except Exception:
-            _desired_present = False
-        if _desired_present and all(not _meets(o.get("completion_date")) for o in viable_options):
-            _all_miss = True
-    if (not viable_options) or _all_miss:
-        try:
-            changes = search_changes(
-                user_id, req_date, req_amt_dec, profile, events_for_oracle, fx_rows,
-                recurrence_flags, evidence_flags=evidence_flags, expense_facts=expense_facts,
+            change_sets = build_change_sets(
+                user_id, profile, events_for_oracle, recurrence_flags
             )
-            if changes:
-                spending_needed = "|".join(changes)
-                # Re-evaluate under the SAME semantics search_changes validated:
-                # in-window rows are real upcoming cash (copy edit), while
-                # pre-request history never hits the ledger, so only category
-                # suppression removes the category's forward forecast.
-                mod_events = [dict(e) for e in events_for_oracle]
-                suppressed_cats: set[str] = set()
-                for ch in changes:
-                    parts = ch.split(":")
-                    target = None
-                    if parts[0] == "stop" and len(parts) == 2:
-                        target = parts[1]
-                    elif parts[0] == "reduce_to" and len(parts) == 3:
-                        target = parts[1]
-                    if target is None:
-                        continue
-                    for e in mod_events:
-                        if e.get("event_id") == target:
-                            e["amount"] = "0" if parts[0] == "stop" else parts[2]
-                            cat = str(e.get("category", "") or "").strip().lower()
-                            if cat:
-                                suppressed_cats.add(cat)
-                res2 = solve_safe_amount(
-                    user_id, req_date, str(req_amt_dec), profile, mod_events, fx_rows,
-                    recurrence_flags, suppressed_categories=suppressed_cats,
-                    evidence_flags=evidence_flags, expense_facts=expense_facts,
-                )
-                # A fail-closed re-run certifies nothing: adding its options
-                # would rank a plan the ledger cannot support.
-                if not res2.get("fail_closed"):
-                    _append_changed_options(res2["safe_amount"], res2["earliest_date"],
-                                            res2.get("ledger", []), spending_needed)
-                else:
-                    spending_needed = "none"
         except Exception:
-            pass
-        if not viable_options:
-            return {
-                "request_id": rid,
-                "amount_safe_to_pay": str(safe_amt),
-                "affordability_status": "not_affordable",
-                "recommended_payment_method": "not_recommended",
-                "payment_plan": "none",
-                "earliest_date_for_full_payment": None,
-                "spending_changes_needed": "none",
-                "decision_explanation": "No viable payment options found.",
-                "evidence": evidence,
-            }
+            change_sets = []
+        counter = 0
+        for size in range(1, 4):
+            for change_set in (combo for combo in change_sets if len(combo) == size):
+                counter += 1
+                try:
+                    modified, suppressed, overrides = apply_changes(events_for_oracle, change_set)
+                    changed = solve_safe_amount(
+                        user_id, req_date, str(req_amt_dec), profile, modified, fx_rows,
+                        recurrence_flags,
+                        suppressed_categories=suppressed,
+                        category_overrides=overrides,
+                        evidence_flags=evidence_flags,
+                        expense_facts=expense_facts,
+                    )
+                except Exception:
+                    continue
+                # A fail-closed ledger certifies nothing: never build options from it.
+                if changed.get("fail_closed"):
+                    continue
+                # An identical real ledger means the change had no cash effect, so
+                # every plan shape it could offer already exists with fewer changes.
+                base_ledger = base_state["ledger"]
+                if len(base_ledger) == 91 and changed.get("ledger") == base_ledger:
+                    continue
+                state = {
+                    "safe": changed["safe_amount"],
+                    "earliest": changed["earliest_date"],
+                    "ledger": changed.get("ledger") or [],
+                    "changes": [describe_action(action) for action in change_set],
+                    "suffix": f"_chg{counter}",
+                }
+                candidates.extend(_build_candidates(state, base_state, ctx))
+            ranked = rank_options(candidates, desired_completion_date)
+            if ranked:
+                break
 
-    # Spec rank order: deadline âœ“, no changes, minimize total, start earlier, fewer legs, lowest option_id
-    def spec_key(o):
-        return (
-            0 if _meets(o.get("completion_date")) else 1,
-            o.get("changes", 0),
-            Decimal(str(o.get("total_cost", o.get("cost", "Infinity")))),
-            o.get("start_date", "9999-12-31"),
-            o.get("legs", o.get("num_payments", 999)),
-            o.get("id", o.get("option_id", "zzz")),
-        )
-    ranked = sorted(viable_options, key=spec_key)
+    if not ranked:
+        deadline = parse_deadline(desired_completion_date)
+        reason = "No safe payment plan keeps the balance above the minimum"
+        if deadline is not None:
+            reason += f" and completes by {deadline.isoformat()}"
+        return {
+            "request_id": rid,
+            "amount_safe_to_pay": str(safe_amt),
+            "affordability_status": "not_affordable",
+            "recommended_payment_method": "not_recommended",
+            "payment_plan": "none",
+            "earliest_date_for_full_payment": None,
+            "spending_changes_needed": "none",
+            "decision_explanation": (
+                f"{reason}. The request is not affordable without inventing income or "
+                "breaching a protected commitment, so no payment is recommended."
+            ),
+            "evidence": evidence,
+        }
+
     best = ranked[0]
+    explanation = f"Recommended {best['payment_method']} ({best['affordability_status']})."
+    if best.get("spending_changes") not in (None, "", "none"):
+        explanation = (
+            f"Recommended {best['payment_method']} ({best['affordability_status']}) after "
+            f"permitted spending changes ({best['spending_changes']})."
+        )
 
     return {
         "request_id": rid,
+        # Output contract: these two fields are always the base (no optional
+        # changes) oracle values, whatever plan wins.
         "amount_safe_to_pay": str(safe_amt),
         "affordability_status": best["affordability_status"],
         "recommended_payment_method": best["payment_method"],
         "payment_plan": best["payment_plan"],
         "earliest_date_for_full_payment": earliest,
         "spending_changes_needed": best["spending_changes"],
-        "decision_explanation": f"Recommended {best['payment_method']} based on ranking.",
+        "decision_explanation": explanation,
         "evidence": evidence,
     }
