@@ -13,4 +13,9 @@ code.zip
 evaluation/report.json
 evaluation/report.md
 traces/
+data/app.db
+data/app.db-shm
+data/app.db-wal
+data/app.db-journal
+data/ocr_text.json
 

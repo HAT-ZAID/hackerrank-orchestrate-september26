@@ -139,6 +139,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         "search_messages",
     ),
     ToolSpec(
+        "search_evidence",
+        "RAG-first citation search over stored messages/events (citations only, never numbers).",
+        ("query", "user_id", "request_id", "limit"),
+        "search_evidence",
+    ),
+    ToolSpec(
         "get_cashflow_projection",
         "Oracle projection for the base state or a validated spending-change set.",
         ("request_id", "spending_changes"),
@@ -234,12 +240,15 @@ class DatasetBundle:
 class Toolbox:
     """Dataset-scoped tool registry with per-run memoization and optional trace."""
 
-    def __init__(self, repo_root=None, *, data=None, kernel_results=None, trace=None):
+    def __init__(self, repo_root=None, *, data=None, kernel_results=None, trace=None, retriever=None):
         self.repo_root = Path(repo_root) if repo_root is not None else REPO_ROOT
         self._data = data
         self._kernel_results = kernel_results if kernel_results is not None else {}
         self._cache: dict = {}
         self.trace = trace
+        # Optional RAG retriever (code.rag).  ``None`` keeps the tool layer fully
+        # offline: search_evidence then uses its own lexical SQLite-free fallback.
+        self.retriever = retriever
 
     # -- registry ---------------------------------------------------------
 
@@ -578,6 +587,119 @@ class Toolbox:
             for _, row in scored[:capped]
         ]
         return {"user_id": str(user_id), "count": len(citations), "citations": citations}
+
+    @_structured
+    def search_evidence(
+        self,
+        query: str,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        limit: int = 8,
+    ) -> dict:
+        """RAG-first evidence lookup: citations only, never authoritative numbers."""
+        if not isinstance(query, str) or not query.strip():
+            raise ToolError("query must be a non-empty string")
+        try:
+            capped = max(1, min(int(limit), MAX_EVENT_LIMIT))
+        except (TypeError, ValueError) as exc:
+            raise ToolError("limit must be an integer") from exc
+        if user_id is not None and not str(user_id).strip():
+            raise ToolError("user_id must be a non-empty string when supplied")
+        if request_id is not None and not str(request_id).strip():
+            raise ToolError("request_id must be a non-empty string when supplied")
+
+        warnings: list[dict] = []
+        retriever = self.retriever
+        if retriever is None:
+            citations = self._lexical_citations(query, user_id=user_id, limit=capped)
+            backend = "lexical"
+        else:
+            citations = list(
+                retriever.search(
+                    query,
+                    user_id=str(user_id) if user_id else None,
+                    request_id=str(request_id) if request_id else None,
+                    limit=capped,
+                )
+                or []
+            )
+            backend = str(getattr(retriever, "last_backend", "fts") or "fts")
+            warnings = [dict(item) for item in (getattr(retriever, "warnings", None) or [])]
+
+        note_retrieval = getattr(self.trace, "note_retrieval", None)
+        if callable(note_retrieval):
+            note_retrieval(backend, warnings=warnings, query=query)
+
+        return {
+            "query": str(query),
+            "backend": backend,
+            "authoritative": False,
+            "note": (
+                "Citations are candidate evidence only. Amounts, dates and balances "
+                "must come from get_financial_events / get_cashflow_projection."
+            ),
+            "warnings": warnings,
+            "count": len(citations[:capped]),
+            "citations": [_plain(citation) for citation in citations[:capped]],
+        }
+
+    def _lexical_citations(self, query: str, *, user_id=None, limit: int = 8) -> list[dict]:
+        """Offline fallback when no retriever is configured (messages + events)."""
+        tokens = [token for token in re.split(r"[^0-9a-z]+", query.lower()) if len(token) > 1]
+        if not tokens:
+            raise ToolError("query has no searchable terms")
+        scored: list[tuple[int, str, dict]] = []
+        for row in self._bundle().messages.to_dict("records"):
+            if user_id and _text(row.get("user_id")) != str(user_id):
+                continue
+            text = _text(row.get("message_text"))
+            if not text:
+                continue
+            score = sum(1 for token in tokens if token in text.lower())
+            if score:
+                scored.append(
+                    (
+                        score,
+                        f"message:{_text(row.get('message_id'))}",
+                        {
+                            "chunk_id": f"message:{_text(row.get('message_id'))}",
+                            "source_type": "message",
+                            "source_id": _text(row.get("message_id")),
+                            "user_id": _text(row.get("user_id")),
+                            "request_id": _text(row.get("request_id")),
+                            "text": text,
+                            "metadata": {"sent_at": _text(row.get("sent_at"))},
+                            "score": None,
+                            "backend": "lexical",
+                        },
+                    )
+                )
+        if user_id:
+            for event in self._user_events(user_id):
+                text = _text(event.get("description"))
+                if not text:
+                    continue
+                score = sum(1 for token in tokens if token in text.lower())
+                if score:
+                    scored.append(
+                        (
+                            score,
+                            f"event:{_text(event.get('event_id'))}",
+                            {
+                                "chunk_id": f"event:{_text(event.get('event_id'))}",
+                                "source_type": "event",
+                                "source_id": _text(event.get("event_id")),
+                                "user_id": _text(event.get("user_id")),
+                                "request_id": "",
+                                "text": text,
+                                "metadata": {"category": _text(event.get("category"))},
+                                "score": None,
+                                "backend": "lexical",
+                            },
+                        )
+                    )
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [citation for _, _, citation in scored[:limit]]
 
     @_structured
     def get_cashflow_projection(self, request_id: str, spending_changes=None) -> dict:

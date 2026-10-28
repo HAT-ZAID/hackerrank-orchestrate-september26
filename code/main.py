@@ -99,9 +99,64 @@ def _money_plan(plan: str, safe_amount: str, requested_amount: str, partial: boo
     )
 
 
-def main():
-    output_df, _usage = run_pipeline()
+def main(argv=None):
+    options = _cli_options(sys.argv[1:] if argv is None else argv)
+    if options["agent"] or options["agent_limit"]:
+        output_df, _usage = run_pipeline(
+            agent_limit=options["agent_limit"] or options["agent_default_limit"],
+            trace_dir=options["trace_dir"],
+        )
+    else:
+        output_df, _usage = run_pipeline()
     print(f"Wrote {len(output_df)} rows to output.csv")
+    return output_df
+
+
+#: ``--agent`` without ``--agent-limit`` inspects this many requests.
+DEFAULT_AGENT_LIMIT = 1
+
+
+def _cli_options(argv) -> dict:
+    """Hand-rolled flag parser: the no-argument path must stay byte-identical."""
+    options = {
+        "agent": False,
+        "agent_limit": 0,
+        "agent_default_limit": DEFAULT_AGENT_LIMIT,
+        "trace_dir": None,
+    }
+    items = list(argv)
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item == "--agent":
+            options["agent"] = True
+        elif item == "--agent-limit" or item.startswith("--agent-limit="):
+            if "=" in item:
+                value = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(items):
+                    raise SystemExit("--agent-limit needs a number")
+                value = items[index]
+            try:
+                options["agent_limit"] = max(0, int(value))
+            except ValueError as exc:
+                raise SystemExit(f"--agent-limit must be an integer, got {value!r}") from exc
+        elif item == "--trace-dir" or item.startswith("--trace-dir="):
+            if "=" in item:
+                options["trace_dir"] = item.split("=", 1)[1]
+            else:
+                index += 1
+                if index >= len(items):
+                    raise SystemExit("--trace-dir needs a directory")
+                options["trace_dir"] = items[index]
+        else:
+            raise SystemExit(
+                f"unknown argument {item!r}; usage: python -m code.main "
+                "[--agent [--agent-limit N] [--trace-dir DIR]]"
+            )
+        index += 1
+    return options
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -117,6 +172,8 @@ def run_pipeline(
     provider=None,
     trace_dir=None,
     agent_request_ids=None,
+    agent=None,
+    agent_limit=0,
 ):
     """Run the production pipeline and return ``(output_frame, usage)``.
 
@@ -134,6 +191,14 @@ def run_pipeline(
       ``NullProvider``). It can only propose; the kernel keeps ownership.
     - ``trace_dir``: when set, one JSON trace per agent request is written under
       ``trace_dir/<run_id>/<request_id>.json``. ``None`` writes nothing.
+
+    Task 5B options (also additive, also off by default):
+
+    - ``agent_limit``: run the bounded tool-calling loop
+      (:func:`code.agent.run_agent_loop`) for at most this many requests, in
+      dataset order. ``0`` keeps the deterministic path exactly as it was, and
+      the verifier still owns every machine field.
+    - ``agent``: inject the loop callable (tests use a scripted one).
     """
     root = Path(repo_root).resolve() if repo_root is not None else REPO_ROOT
     ocr_path = configure_runtime()
@@ -158,14 +223,16 @@ def run_pipeline(
         ocr_available=ocr_path is not None,
     )
 
-    # Optional agent substrate (Task 5A). Built only when request ids are named,
-    # so the default run allocates nothing and writes no traces.
+    # Optional agent substrate (Task 5A) and bounded agent loop (Task 5B). Both
+    # are built only when explicitly asked for, so the default run allocates
+    # nothing, imports no agent/RAG code and writes no traces.
     agent_ids = {
         str(item).strip() for item in (agent_request_ids or ()) if str(item).strip()
     }
+    agent_count = max(0, int(agent_limit or 0))
     agent_state = None
-    if agent_ids:
-        from code.agent import run_agent_once
+    loop_state = None
+    if agent_ids or agent_count > 0:
         from code.tools import DatasetBundle, Toolbox
         from code.trace import TraceRecorder
 
@@ -187,13 +254,44 @@ def run_pipeline(
             kernel_results=kernel_results,
             trace=recorder,
         )
-        agent_state = {
-            "ids": agent_ids,
-            "run": run_agent_once,
-            "toolbox": toolbox,
-            "recorder": recorder,
-            "kernel_results": kernel_results,
-        }
+
+        if agent_ids:
+            from code.agent import run_agent_once
+
+            agent_state = {
+                "ids": agent_ids,
+                "run": run_agent_once,
+                "toolbox": toolbox,
+                "recorder": recorder,
+                "kernel_results": kernel_results,
+            }
+        else:
+            from code.agent import run_agent_loop
+            from code.providers import build_provider
+            from code.rag import build_retriever
+
+            if provider is not None:
+                resolved_provider, provider_reason = provider, None
+            else:
+                resolved_provider, provider_reason = build_provider()
+            retriever = None
+            try:
+                retriever = build_retriever(root)
+            except Exception:
+                retriever = None
+            if retriever is not None:
+                toolbox.retriever = retriever
+            loop_state = {
+                "run": agent if callable(agent) else run_agent_loop,
+                "provider": resolved_provider,
+                "provider_reason": provider_reason,
+                "toolbox": toolbox,
+                "recorder": recorder,
+                "kernel_results": kernel_results,
+                "store": getattr(getattr(retriever, "fts", None), "store", None),
+                "limit": agent_count,
+                "used": 0,
+            }
 
     # Prepare output rows
     output_rows = []
@@ -242,6 +340,49 @@ def run_pipeline(
             if outcome is not None:
                 agent_outcome = outcome
                 res = outcome["row"]
+
+        # Task 5B bounded loop: the first ``agent_limit`` requests (in dataset
+        # order). The verifier still owns every machine field, and any failure
+        # leaves the kernel row untouched.
+        if loop_state is not None and loop_state["used"] < loop_state["limit"]:
+            loop_state["used"] += 1
+            loop_state["kernel_results"][req["request_id"]] = res
+            try:
+                outcome = loop_state["run"](
+                    {
+                        "request_id": req["request_id"],
+                        "user_id": user_id,
+                        "request": req.to_dict(),
+                        "profile": profile,
+                    },
+                    provider=loop_state["provider"],
+                    tools=loop_state["toolbox"],
+                    trace=loop_state["recorder"],
+                )
+            except Exception:
+                outcome = None
+            if outcome is not None:
+                agent_outcome = outcome
+                res = outcome["row"]
+                store = loop_state.get("store")
+                describe = getattr(outcome, "as_dict", None)
+                if store is not None and callable(describe):
+                    payload = describe()
+                    try:
+                        store.record_trace(
+                            {
+                                "run_id": loop_state["recorder"].run_id,
+                                "request_id": req["request_id"],
+                                "provider": payload.get("provider"),
+                                "model": payload.get("model"),
+                                "fallback_reason": payload.get("fallback_reason"),
+                                "trace_path": payload.get("trace_path"),
+                                "provider_calls": payload.get("provider_calls"),
+                                "tool_calls": payload.get("tool_calls"),
+                            }
+                        )
+                    except Exception:
+                        pass
 
         # Format as output row
         safe_amount = _money(res["amount_safe_to_pay"])
