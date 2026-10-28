@@ -181,6 +181,22 @@ def test_directly_stated_payment_date_belongs_to_the_final_settlement():
     assert by_kind == {"confirmation": None, "final": "2026-03-20"}, by_kind
 
 
+def test_negated_payment_date_is_skipped_for_the_affirmative_one():
+    # "will not be paid on" is negated: the affirmative payment date is the one that counts.
+    facts = parse_messages(
+        "u1",
+        _messages([
+            _msg(
+                "m1",
+                "Your employment has ended. The final settlement of USD 500 will not be paid "
+                "on 2026-03-20 but will be paid on 2026-04-01. Payroll ref EMP-0105.",
+            )
+        ]),
+    )
+    final = next(c for c in facts["salary_changes"] if c["kind"] == "final")
+    assert final["settlement_date"] == "2026-04-01", final
+
+
 def test_employment_and_contract_end_are_stop_signals_not_income():
     df = _messages([
         _msg(
@@ -442,6 +458,31 @@ def test_negation_scope_stops_at_a_clause_boundary():
         )
     )
     assert short["action"] == "cancelled", f"got {short}"
+
+
+def test_not_yet_cancelled_is_not_a_cancellation():
+    from code.reconcile import amendment_from_message
+
+    # "yet" is part of the negation ("not yet"), not a clause boundary.
+    pending = amendment_from_message(
+        _msg(
+            "m1",
+            "This invoice is not yet cancelled and is still pending.",
+            related="e1",
+            sent_at="2025-01-06T00:00:00Z",
+        )
+    )
+    assert pending["action"] == "pending", f"got {pending}"
+
+    bare = amendment_from_message(
+        _msg(
+            "m2",
+            "The invoice is not yet cancelled.",
+            related="e1",
+            sent_at="2025-01-07T00:00:00Z",
+        )
+    )
+    assert bare["action"] == "none", f"got {bare}"
 
 
 def test_reconcile_warns_instead_of_misapplying():

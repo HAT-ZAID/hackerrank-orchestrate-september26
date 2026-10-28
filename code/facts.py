@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from code.amounts import extract_amounts
-from code.reconcile import amendment_from_message
+from code.reconcile import amendment_from_message, negation_before
 
 # Documented vocabularies (brief §Deliverable 1). Kept as data so Task 3 and the
 # schema/verifier tasks can validate facts without re-deriving the strings.
@@ -392,20 +392,18 @@ def _fact_date(text: str, cue: re.Pattern[str]) -> str | None:
         if other:
             end = min(end, other.start())
     region = text[match.end() : end]
-    cue_matches = [
-        found
-        for found in (
-            _CREDIT_CUE.search(region),
-            _EFFECTIVE_CUE.search(region),
-            _PAYMENT_DATE_CUE.search(region),
-        )
-        if found
-    ]
-    if not cue_matches:
-        return None
-    first = min(cue_matches, key=lambda found: found.start())
-    date_match = _ISO_DATE.search(region[first.end() :])
-    return date_match.group(1) if date_match else None
+    cue_matches = []
+    for date_cue in (_CREDIT_CUE, _EFFECTIVE_CUE, _PAYMENT_DATE_CUE):
+        cue_matches.extend(date_cue.finditer(region))
+    for candidate in sorted(cue_matches, key=lambda found: found.start()):
+        # A negated date cue ("will not be paid on 2026-03-20") is not a date for
+        # this fact; keep looking for the first affirmative one.
+        if negation_before(region, candidate.start()):
+            continue
+        date_match = _ISO_DATE.search(region[candidate.end() :])
+        if date_match:
+            return date_match.group(1)
+    return None
 
 
 def _lang(text: str) -> str:

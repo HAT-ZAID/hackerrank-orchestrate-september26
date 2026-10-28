@@ -39,9 +39,10 @@ _NEGATION_TOKEN = re.compile(
 )
 _NEGATION_WINDOW = 24
 # A clause boundary ends a negation's reach: "not cancelled, but cancelled today"
-# negates only its own mention.
+# negates only its own mention. "yet" is deliberately absent: in "not yet
+# cancelled" it belongs to the negation, not to a new clause.
 _CLAUSE_BOUNDARY = re.compile(
-    r"[,;:.!?()\n]|\b(?:but|however|although|though|yet|while|whereas|tetapi|namun)\b",
+    r"[,;:.!?()\n]|\b(?:but|however|although|though|while|whereas|tetapi|namun)\b",
     re.IGNORECASE,
 )
 _SETTLE_CUE = re.compile(
@@ -125,19 +126,28 @@ def _amount_str(value: float) -> str:
     return str(value)
 
 
-def _negation_head(text: str, start: int, previous_end: int) -> str:
+def _clause_head(text: str, start: int, floor: int) -> str:
     """Text a negation may reach back over for the mention starting at ``start``.
 
-    Lookback stops at the previous cancellation mention and at the nearest clause
+    Lookback stops at ``floor`` (the previous mention) and at the nearest clause
     boundary, so "not cancelled, but cancelled today" negates only the first one.
     """
-    head = text[max(previous_end, start - _NEGATION_WINDOW) : start]
+    head = text[max(floor, start - _NEGATION_WINDOW) : start]
     boundary = None
     for found in _CLAUSE_BOUNDARY.finditer(head):
         boundary = found
     if boundary is not None:
         head = head[boundary.end() :]
     return head
+
+
+def negation_before(text: str, position: int, floor: int = 0) -> bool:
+    """True when the wording immediately before ``position`` negates it.
+
+    Shared with the date-cue reader in ``code/facts.py`` so "will not be paid on"
+    and "not yet cancelled" follow one rule.
+    """
+    return bool(_NEGATION_TOKEN.search(_clause_head(text, position, floor)))
 
 
 def _has_cancellation(text: str) -> bool:
@@ -149,7 +159,7 @@ def _has_cancellation(text: str) -> bool:
     """
     previous_end = 0
     for match in _CANCEL_CUE.finditer(text):
-        if not _NEGATION_TOKEN.search(_negation_head(text, match.start(), previous_end)):
+        if not negation_before(text, match.start(), previous_end):
             return True
         previous_end = match.end()
     return False
