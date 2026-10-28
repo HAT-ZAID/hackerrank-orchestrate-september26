@@ -210,7 +210,54 @@ def test_salary_projection_counts_real_in_window_rows_toward_cap():
     assert _entries(result, "income") == []
 
 
-# 7. Uncovered essential-variable spend is reserved across the horizon.
+# 7. An ineligible in-window bonus must not consume the cap or move the anchor.
+def test_ineligible_in_window_bonus_does_not_change_salary_projection():
+    history = _monthly(
+        "salary",
+        ("2025-10", "2025-11", "2025-12", "2026-01"),
+        amount="2000",
+        event_type="income",
+        direction="credit",
+        description="Payroll credit",
+    )
+    baseline = build_forecast(history, "2026-02-01")
+    bonus = _event(
+        "salary_bonus",
+        "2026-02-25",
+        "salary",
+        "5000",
+        event_type="income",
+        direction="credit",
+        status="scheduled",
+        description="Annual bonus",
+    )
+    result = build_forecast(history + [bonus], "2026-02-01")
+
+    baseline_dates = [entry.date for entry in _entries(baseline, "income")]
+    result_dates = [entry.date for entry in _entries(result, "income")]
+    assert result_dates == baseline_dates
+    assert len(result_dates) == 2
+
+
+# 8. Suppressing an essential-variable category removes its direct forecast and reserve.
+def test_suppressed_category_removes_direct_forecast_and_reserve():
+    events = [
+        _event("groceries_nov", "2025-11-05", "groceries", "300"),
+        _event("groceries_dec", "2025-12-05", "groceries", "300"),
+        _event("groceries_jan", "2026-01-05", "groceries", "300"),
+    ]
+    result = build_forecast(
+        events,
+        "2026-02-01",
+        recurrence_flags=_flags(("u1", "groceries", "expense")),
+        suppressed_categories={"groceries"},
+    )
+
+    groceries = [entry for entry in result.entries if entry.category == "groceries"]
+    assert groceries == []
+
+
+# 9. Uncovered essential-variable spend is reserved across the horizon.
 def test_uncovered_essential_variable_spend_is_reserved():
     events = [
         _event("groceries_nov", "2025-11-05", "groceries", "300"),
@@ -225,7 +272,7 @@ def test_uncovered_essential_variable_spend_is_reserved():
     assert sum(abs(entry.amount) for entry in reserved) == Decimal("900")
 
 
-# 8. A recurring forecast for the same category offsets the reserve.
+# 10. A recurring forecast for the same category offsets the reserve.
 def test_recurring_forecast_offsets_the_variable_reserve():
     events = [
         _event("groceries_nov", "2025-11-05", "groceries", "300"),
@@ -248,7 +295,7 @@ def test_recurring_forecast_offsets_the_variable_reserve():
     assert len(recurring) == 3
 
 
-# 9. solve_safe_amount returns fail_closed=True with an empty ledger on STATUS_UNKNOWN.
+# 11. solve_safe_amount returns fail_closed=True with an empty ledger on STATUS_UNKNOWN.
 def test_oracle_fails_closed_with_empty_ledger_on_unknown_status():
     events = [_event("e1", "2026-01-02", "rent", "1000", status="unknown")]
     profile = {
@@ -267,7 +314,7 @@ def test_oracle_fails_closed_with_empty_ledger_on_unknown_status():
     assert result["fail_closed_reason"] == "STATUS_UNKNOWN"
 
 
-# 10. solve_request returns not_affordable/not_recommended on fail_closed=True.
+# 12. solve_request returns not_affordable/not_recommended on fail_closed=True.
 def test_solver_returns_not_recommended_when_the_ledger_fails_closed(monkeypatch):
     def fake_safe_amount(*_args, **_kwargs):
         return {

@@ -482,6 +482,7 @@ def _essential_variable_reserve(
     covered_entries: list[ForecastEntry],
     expense_facts,
     warnings: list[dict],
+    skipped_categories=None,
 ) -> list[ForecastEntry]:
     """Reserve essential variable spend not already covered by committed rows.
 
@@ -489,8 +490,10 @@ def _essential_variable_reserve(
     ``covered`` is the recurring forecast plus real countable in-window rows for
     the same category.  Reserve rows post at the bucket start, so the ledger sees
     the outflow conservatively early.  An ended-expense fact suppresses reserve
-    buckets on/after its effective date.
+    buckets on/after its effective date.  ``skipped_categories`` mirrors the
+    unprotected suppressions applied by the direct forecast.
     """
+    skipped = {_norm(category) for category in (skipped_categories or ()) if _norm(category)}
     history = _essential_variable_history(
         events,
         req_date,
@@ -536,6 +539,8 @@ def _essential_variable_reserve(
 
     entries: list[ForecastEntry] = []
     for category in sorted(history):
+        if category in skipped:
+            continue
         monthly_median = _median_decimal(history[category])
         for offset in range(0, HORIZON_DAYS, VARIABLE_RESERVE_BUCKET_DAYS):
             bucket_start = req_date + timedelta(days=offset)
@@ -709,6 +714,9 @@ def _income_forecast(
         if _norm(event.get("category")) not in PRIMARY_INCOME_CATEGORIES:
             continue
         if _norm(event.get("event_type")) != "income":
+            continue
+        real_description = _norm(event.get("description"))
+        if not _income_stream_is_eligible(real_description):
             continue
         event_day = _event_day(event)
         if event_day is None or not (req_date <= event_day <= window_end):
@@ -982,6 +990,7 @@ def build_forecast(
         covered_entries=expense_entries,
         expense_facts=expense_facts,
         warnings=warnings,
+        skipped_categories=suppressed - protected,
     )
     income_entries, income_stream = _income_forecast(
         events,
