@@ -38,6 +38,12 @@ _NEGATION_TOKEN = re.compile(
     r"\b(?:not|never|no|tidak|belum|bukan)\b|(?:n't|n\u2019t)\b", re.IGNORECASE
 )
 _NEGATION_WINDOW = 24
+# A clause boundary ends a negation's reach: "not cancelled, but cancelled today"
+# negates only its own mention.
+_CLAUSE_BOUNDARY = re.compile(
+    r"[,;:.!?()\n]|\b(?:but|however|although|though|yet|while|whereas|tetapi|namun)\b",
+    re.IGNORECASE,
+)
 _SETTLE_CUE = re.compile(
     r"has reached your account|proceeds have settled|has settled in the cash account"
     r"|payment was received|has been credited|already credited"
@@ -119,6 +125,21 @@ def _amount_str(value: float) -> str:
     return str(value)
 
 
+def _negation_head(text: str, start: int, previous_end: int) -> str:
+    """Text a negation may reach back over for the mention starting at ``start``.
+
+    Lookback stops at the previous cancellation mention and at the nearest clause
+    boundary, so "not cancelled, but cancelled today" negates only the first one.
+    """
+    head = text[max(previous_end, start - _NEGATION_WINDOW) : start]
+    boundary = None
+    for found in _CLAUSE_BOUNDARY.finditer(head):
+        boundary = found
+    if boundary is not None:
+        head = head[boundary.end() :]
+    return head
+
+
 def _has_cancellation(text: str) -> bool:
     """True when at least one cancellation mention in ``text`` is not negated.
 
@@ -126,11 +147,11 @@ def _has_cancellation(text: str) -> bool:
     but it was cancelled today" is a cancellation, while "not cancelled and
     still pending" is not.
     """
+    previous_end = 0
     for match in _CANCEL_CUE.finditer(text):
-        head = text[max(0, match.start() - _NEGATION_WINDOW) : match.start()]
-        if _NEGATION_TOKEN.search(head):
-            continue
-        return True
+        if not _NEGATION_TOKEN.search(_negation_head(text, match.start(), previous_end)):
+            return True
+        previous_end = match.end()
     return False
 
 

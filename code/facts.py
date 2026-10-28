@@ -365,6 +365,12 @@ def _date_after(text: str, cue: re.Pattern[str]) -> str | None:
 # region stops where the next fact starts, so a date can never bleed across.
 _FACT_SPLIT_CUES = (_REMAINING_SALARY, _FINAL_PAYMENT)
 
+# Directly attached payment wording ("The final settlement of USD 500 will be paid
+# on 2026-03-20"). Only consulted inside a fact's own region.
+_PAYMENT_DATE_CUE = re.compile(
+    r"will be paid on|paid on|settlement on|dibayarkan pada", re.IGNORECASE
+)
+
 
 def _fact_date(text: str, cue: re.Pattern[str]) -> str | None:
     """Date that belongs to the single fact introduced by ``cue``.
@@ -388,7 +394,11 @@ def _fact_date(text: str, cue: re.Pattern[str]) -> str | None:
     region = text[match.end() : end]
     cue_matches = [
         found
-        for found in (_CREDIT_CUE.search(region), _EFFECTIVE_CUE.search(region))
+        for found in (
+            _CREDIT_CUE.search(region),
+            _EFFECTIVE_CUE.search(region),
+            _PAYMENT_DATE_CUE.search(region),
+        )
         if found
     ]
     if not cue_matches:

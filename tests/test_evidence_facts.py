@@ -160,6 +160,27 @@ def test_undated_fact_does_not_borrow_the_other_fact_date():
     assert by_kind == {"confirmation": "2026-02-10", "final": None}, by_kind
 
 
+def test_directly_stated_payment_date_belongs_to_the_final_settlement():
+    # "will be paid on" is a payment date for this fact, not a shared sentence date.
+    facts = parse_messages(
+        "u1",
+        _messages([
+            _msg(
+                "m1",
+                "Your employment has ended. The remaining confirmed monthly salary is USD 800. "
+                "The final settlement of USD 500 will be paid on 2026-03-20. "
+                "Payroll ref EMP-0104.",
+            )
+        ]),
+    )
+    by_kind = {
+        c["kind"]: c["settlement_date"]
+        for c in facts["salary_changes"]
+        if c["kind"] in {"confirmation", "final"}
+    }
+    assert by_kind == {"confirmation": None, "final": "2026-03-20"}, by_kind
+
+
 def test_employment_and_contract_end_are_stop_signals_not_income():
     df = _messages([
         _msg(
@@ -406,6 +427,21 @@ def test_cancellation_negation_is_scoped_per_match():
         )
     )
     assert plain["action"] == "cancelled", f"got {plain}"
+
+
+def test_negation_scope_stops_at_a_clause_boundary():
+    from code.reconcile import amendment_from_message
+
+    # The lookback must not reach back across the comma/but clause into "not".
+    short = amendment_from_message(
+        _msg(
+            "m1",
+            "The invoice was not cancelled, but cancelled today.",
+            related="e1",
+            sent_at="2025-01-05T00:00:00Z",
+        )
+    )
+    assert short["action"] == "cancelled", f"got {short}"
 
 
 def test_reconcile_warns_instead_of_misapplying():
