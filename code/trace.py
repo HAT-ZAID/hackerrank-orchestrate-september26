@@ -40,9 +40,11 @@ _SECRET_KEY = re.compile(
     re.IGNORECASE,
 )
 #: API-key-shaped substrings inside *values* (provider errors, prompts, args).
-#: Key-name matching above cannot see these, so they are scrubbed too.
+#: Key-name matching above cannot see these, so they are scrubbed too.  ``\b``
+#: keeps ordinary hyphenated words (``desk-booking``, ``risk-free``) intact while
+#: still matching a key at a token boundary.
 _SECRET_VALUE = re.compile(
-    r"(?:(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}|(?i:Bearer\s+)[A-Za-z0-9._-]{8,})"
+    r"(?:\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}|(?i:Bearer\s+)[A-Za-z0-9._-]{8,})"
 )
 _UNSTABLE_KEYS = frozenset({"duration_ms"})
 _UNSTABLE_BLOCKS = frozenset({"metadata"})

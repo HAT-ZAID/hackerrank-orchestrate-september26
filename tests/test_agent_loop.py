@@ -19,10 +19,11 @@ from pathlib import Path
 from langchain_core.messages import AIMessage
 
 from code.agent import AGENT_TOOLS, run_agent_loop
+from code.providers import ChatProvider
 from code.rag import HybridEvidenceRetriever, SQLiteFTSRetriever, VectorEvidenceRetriever
 from code.store import LocalStore
 from code.tools import DatasetBundle, Toolbox
-from code.trace import REDACTED, TraceRecorder
+from code.trace import REDACTED, TraceRecorder, sanitize
 
 REQUEST_ID = "request_demo"
 USER_ID = "user_demo"
@@ -64,23 +65,23 @@ class ScriptedChatModel:
         return turn
 
 
-class ScriptedProvider:
+class ScriptedProvider(ChatProvider):
+    """A ChatProvider whose chat model is scripted (no network, no SDK client)."""
+
+    kind = "scripted"
     name = "scripted"
-    model = "scripted-model"
+    default_model = "scripted-model"
 
     def __init__(self, turns, *, max_calls: int = 50):
+        super().__init__(None, max_calls=max_calls, env={})
         self._model = ScriptedChatModel(turns)
-        self.max_calls = max_calls
 
     def chat_model(self):
         return self._model
 
 
 def _scripted(turns, *, max_calls: int = 50) -> ScriptedProvider:
-    provider = object.__new__(ScriptedProvider)
-    provider._model = ScriptedChatModel(turns)
-    provider.max_calls = max_calls
-    return provider
+    return ScriptedProvider(turns, max_calls=max_calls)
 
 
 def tool_calls(*specs) -> AIMessage:
@@ -374,9 +375,12 @@ def test_tool_error_once_is_recorded_and_recovered(tmp_path):
     root = _tiny_repo(tmp_path)
     toolbox = _toolbox(root, recorder=recorder)
     kernel = toolbox.kernel_result_for(REQUEST_ID)
+    # A bad date is a scope-proof tool error: ids are overridden, other args are not.
     provider = _scripted(
         [
-            tool_calls(("get_request_context", {"request_id": "request_missing"})),
+            tool_calls(
+                ("get_financial_events", {"user_id": USER_ID, "start_date": "01-02-2026"})
+            ),
             tool_calls(("search_evidence", {"query": "payroll", "user_id": USER_ID})),
             tool_calls(("get_cashflow_projection", {"request_id": REQUEST_ID})),
             tool_calls(("propose_decision", {"candidate": _agreeing(kernel)})),
@@ -392,7 +396,7 @@ def test_tool_error_once_is_recorded_and_recovered(tmp_path):
     failures = [
         call
         for call in trace["tool_calls"]
-        if call["name"] == "get_request_context" and not call["ok"]
+        if call["name"] == "get_financial_events" and not call["ok"]
     ]
     assert len(failures) == 1
     assert any(event["kind"] == "tool_error" for event in trace["events"])
@@ -404,11 +408,12 @@ def test_tool_error_once_is_recorded_and_recovered(tmp_path):
 
 
 def test_repeated_tool_failure_is_fatal(tmp_path):
+    bad_date = {"user_id": USER_ID, "start_date": "01-02-2026"}
     result, kernel, _, _ = _run(
         tmp_path,
         [
-            tool_calls(("get_request_context", {"request_id": "request_missing"})),
-            tool_calls(("get_request_context", {"request_id": "request_missing"})),
+            tool_calls(("get_financial_events", bad_date)),
+            tool_calls(("get_financial_events", bad_date)),
             tool_calls(("search_evidence", {"query": "payroll", "user_id": USER_ID})),
         ],
     )
@@ -587,3 +592,184 @@ def test_trace_is_valid_json_and_omits_provider_secrets(tmp_path):
     # A failed turn has no assistant message, but it is recorded as an event.
     assert payload["model_turns"] == []
     assert any(event["kind"] == "provider_failure" for event in payload["events"])
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (CodeRabbit on 987835c)
+# ---------------------------------------------------------------------------
+
+
+def test_run_cap_is_enforced_across_a_shared_provider(tmp_path):
+    """One provider reused for two requests still obeys the per-run call cap."""
+    provider = _scripted([], max_calls=2)
+    provider._model.turns = [
+        tool_calls(("search_evidence", {"query": "payroll", "user_id": USER_ID})),
+        tool_calls(("get_cashflow_projection", {"request_id": REQUEST_ID})),
+        tool_calls(("get_cashflow_projection", {"request_id": REQUEST_ID})),
+    ]
+    first_root = _tiny_repo(tmp_path / "first")
+    first = run_agent_loop(
+        _context(), provider=provider, tools=_toolbox(first_root), trace=None
+    )
+    second_root = _tiny_repo(tmp_path / "second")
+    second = run_agent_loop(
+        _context(), provider=provider, tools=_toolbox(second_root), trace=None
+    )
+
+    assert provider.calls_used == 2
+    assert first.provider_calls == 2
+    assert "budget exhausted" in (first.fallback_reason or "")
+    assert second.provider_calls == 0
+    assert "budget exhausted" in (second.fallback_reason or "")
+    assert "BUY_WAIT_LLM_MAX_CALLS" in (second.fallback_reason or "")
+
+
+def test_tool_arguments_are_scoped_to_the_active_request(tmp_path):
+    recorder = TraceRecorder("run-scope", tmp_path / "traces")
+    root = _tiny_repo(tmp_path)
+    toolbox = _toolbox(root, recorder=recorder)
+    kernel = toolbox.kernel_result_for(REQUEST_ID)
+    provider = _scripted(
+        [
+            tool_calls(
+                (
+                    "search_evidence",
+                    {
+                        "query": "payroll",
+                        "user_id": "user_attacker",
+                        "request_id": "request_attacker",
+                    },
+                )
+            ),
+            tool_calls(("get_request_context", {"request_id": "request_attacker"})),
+            tool_calls(("get_cashflow_projection", {"request_id": "request_attacker"})),
+            tool_calls(("propose_decision", {"candidate": _agreeing(kernel)})),
+        ]
+    )
+
+    result = run_agent_loop(_context(), provider=provider, tools=toolbox, trace=recorder)
+
+    trace = json.loads(Path(result.trace_path).read_text(encoding="utf-8"))
+    dispatched = {call["name"]: call["args"] for call in trace["tool_calls"]}
+    assert dispatched["search_evidence"]["user_id"] == USER_ID
+    assert dispatched["search_evidence"]["request_id"] == REQUEST_ID
+    assert dispatched["get_request_context"]["request_id"] == REQUEST_ID
+    assert dispatched["get_cashflow_projection"]["request_id"] == REQUEST_ID
+    assert all(
+        args.get("user_id") != "user_attacker" for args in dispatched.values()
+    )
+    assert all(
+        args.get("request_id") != "request_attacker" for args in dispatched.values()
+    )
+    assert result.verification["agent_agreement"] is True
+
+
+def test_search_evidence_fails_closed_without_an_active_user(tmp_path):
+    recorder = TraceRecorder("run-scope-missing", tmp_path / "traces")
+    root = _tiny_repo(tmp_path)
+    toolbox = _toolbox(root, recorder=recorder)
+    context = _context()
+    context.pop("user_id")
+    context["request"].pop("user_id")
+    provider = _scripted(
+        [tool_calls(("search_evidence", {"query": "payroll", "user_id": "user_attacker"}))]
+    )
+
+    result = run_agent_loop(context, provider=provider, tools=toolbox, trace=recorder)
+
+    trace = json.loads(Path(result.trace_path).read_text(encoding="utf-8"))
+    assert trace["tool_calls"] == []  # never dispatched with another user's id
+    assert any(event["kind"] == "tool_error" for event in trace["events"])
+    assert result.retrieval_backend is None
+    assert result.fallback_reason
+
+
+def test_non_allowlisted_tools_are_rejected(tmp_path):
+    recorder = TraceRecorder("run-allowlist", tmp_path / "traces")
+    root = _tiny_repo(tmp_path)
+    toolbox = _toolbox(root, recorder=recorder)
+    kernel = toolbox.kernel_result_for(REQUEST_ID)
+    provider = _scripted(
+        [
+            tool_calls(("verify_decision", {"candidate": _candidate()})),
+            tool_calls(("search_messages", {"user_id": USER_ID, "query": "payroll"})),
+        ]
+    )
+
+    result = run_agent_loop(_context(), provider=provider, tools=toolbox, trace=recorder)
+
+    trace = json.loads(Path(result.trace_path).read_text(encoding="utf-8"))
+    assert trace["tool_calls"] == []  # nothing outside the whitelist was dispatched
+    rejected = [
+        event for event in trace["events"] if event["kind"] == "tool_rejected"
+    ]
+    assert len(rejected) == 2
+    assert "not available" in (result.fallback_reason or "")
+    assert result.row["request_id"] == kernel["request_id"]
+
+
+def test_blank_request_evidence_survives_request_filter(tmp_path):
+    root = _tiny_repo(tmp_path)
+    (root / "dataset" / "financial_events.csv").write_text(
+        "event_id,user_id,event_type,description,category,direction,amount,currency,"
+        "event_date,settlement_date,status,linked_event_id,flexibility,"
+        "minimum_allowed_amount\n"
+        f"event_demo,{USER_ID},expense,Office rent transfer,rent,debit,100,USD,"
+        "2025-12-01,2025-12-01,settled,,fixed,\n",
+        encoding="utf-8",
+    )
+
+    with LocalStore(root / "data" / "app.db", repo_root=root) as store:
+        store.build()
+
+        # Event chunks never carry a request id; a request-scoped query must keep
+        # them (only the user filter narrows the result).
+        hits = store.search_fts("rent", request_id=REQUEST_ID)
+        assert any(
+            hit["chunk_id"] == "event:event_demo" and hit["request_id"] == ""
+            for hit in hits
+        )
+        assert store.search_fts("rent", request_id=REQUEST_ID, user_id="user_other") == []
+
+        chunks = store.chunks(request_id=REQUEST_ID)
+        assert any(chunk["chunk_id"] == "event:event_demo" for chunk in chunks)
+
+        hybrid = HybridEvidenceRetriever(fts=SQLiteFTSRetriever(store))
+        scoped = hybrid.search("rent", request_id=REQUEST_ID)
+        assert any(hit["chunk_id"] == "event:event_demo" for hit in scoped)
+
+
+def test_oversized_tool_message_stays_valid_json():
+    from code.agent import MAX_TOOL_MESSAGE_CHARS, _tool_message_content
+
+    envelope = {
+        "ok": True,
+        "data": {
+            "request_id": REQUEST_ID,
+            "count": 80,
+            "citations": [
+                {"chunk_id": f"message:{index}", "text": "x" * 200}
+                for index in range(80)
+            ],
+        },
+    }
+    assert len(json.dumps(envelope)) > MAX_TOOL_MESSAGE_CHARS
+
+    payload = json.loads(_tool_message_content(envelope))
+
+    assert payload["ok"] is True
+    assert payload["truncated"] is True
+    assert payload["data"]["request_id"] == REQUEST_ID
+    assert len(_tool_message_content(envelope)) <= MAX_TOOL_MESSAGE_CHARS
+
+
+def test_secret_scrubbing_ignores_hyphenated_words():
+    cleaned = sanitize(
+        {
+            "note": "desk-reservation and network-provider approvals",
+            "detail": "sk-live-abcdef123456",
+        }
+    )
+
+    assert cleaned["note"] == "desk-reservation and network-provider approvals"
+    assert cleaned["detail"] == REDACTED

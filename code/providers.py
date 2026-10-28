@@ -152,17 +152,45 @@ class ChatProvider:
         self.max_calls = _int_from_env(env, MAX_CALLS_ENV, DEFAULT_MAX_CALLS, minimum=1)
         if max_calls is not None:
             self.max_calls = max(1, int(max_calls))
+        #: Calls already spent by this provider instance (shared across requests).
+        self.calls_used = 0
 
     @classmethod
     def model_env_name(cls) -> str:
         return MODEL_ENV
+
+    # -- run budget -------------------------------------------------------
+
+    def reserve_call(self) -> bool:
+        """Claim one call from ``BUY_WAIT_LLM_MAX_CALLS``; ``False`` when spent.
+
+        Counted before the request is made, so a failing or timing-out turn
+        still consumes the run budget.  One provider instance is shared across
+        requests, which is what makes this a *per-run* cap rather than a
+        per-request one.
+        """
+        if self.calls_used >= self.max_calls:
+            return False
+        self.calls_used += 1
+        return True
+
+    @property
+    def remaining_calls(self) -> int:
+        return max(0, self.max_calls - self.calls_used)
 
     def chat_model(self):
         """Return an unbound LangChain chat model; raise when unavailable."""
         raise ProviderUnavailable(f"provider {self.kind!r} has no chat model")
 
     def describe(self) -> dict:
-        return {"name": self.name, "model": self.model, "kind": self.kind, "max_calls": self.max_calls}
+        return {
+            "name": self.name,
+            "model": self.model,
+            "kind": self.kind,
+            "max_calls": self.max_calls,
+            "calls_used": self.calls_used,
+            "remaining_calls": self.remaining_calls,
+        }
 
 
 class OllamaProvider(ChatProvider):

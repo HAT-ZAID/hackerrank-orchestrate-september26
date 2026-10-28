@@ -194,8 +194,12 @@ class VectorEvidenceRetriever:
             metadata = dict(document.metadata or {})
             if user_id and str(metadata.get("user_id") or "") != str(user_id):
                 continue
-            if request_id and str(metadata.get("request_id") or "") != str(request_id):
-                continue
+            if request_id:
+                # Blank request ids are user-level evidence (events, most
+                # messages) and must not be filtered out by request scoping.
+                chunk_request = str(metadata.get("request_id") or "")
+                if chunk_request and chunk_request != str(request_id):
+                    continue
             hits.append(
                 {
                     "chunk_id": str(metadata.get("chunk_id") or ""),

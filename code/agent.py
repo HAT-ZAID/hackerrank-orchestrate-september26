@@ -75,6 +75,20 @@ AGENT_TOOLS = (
 MAX_TOOL_MESSAGE_CHARS = 4000
 MAX_FINAL_RETRIES = 1
 
+#: Tools that must be scoped to the active user before dispatch, and tools that
+#: must be scoped to the active request.  ``search_messages`` is not exposed to
+#: the loop today (allowlist); it is listed here as defence in depth.
+USER_SCOPED_TOOLS = ("search_evidence", "search_messages", "get_financial_events")
+REQUEST_SCOPED_TOOLS = (
+    "get_request_context",
+    "get_payment_options",
+    "get_cashflow_projection",
+    "list_spending_change_candidates",
+)
+#: Tools whose optional request filter is forced to the active request *when the
+#: model supplies one*, so a probe cannot point at another request's evidence.
+REQUEST_FILTER_TOOLS = ("search_evidence",)
+
 SYSTEM_PROMPT = f"""You are the planning agent for the Buy or Wait? financial decision task.
 
 You do NOT own the answer. A deterministic kernel computes the seven machine
@@ -430,11 +444,110 @@ def _json_candidate(content):
     return None
 
 
+def _preview(value):
+    """Compact, still-JSON marker replacing a value that did not fit."""
+    if isinstance(value, list):
+        return {"omitted": True, "count": len(value)}
+    if isinstance(value, dict):
+        return {"omitted": True, "keys": sorted(str(key) for key in value)[:8]}
+    if isinstance(value, str):
+        return value[:120]
+    return value
+
+
 def _tool_message_content(envelope) -> str:
+    """JSON text for a tool reply, truncated *before* serialization.
+
+    A sliced JSON string is not JSON, so an oversized envelope is rebuilt with
+    whole keys only: identity/status fields are kept, values that would overflow
+    become :func:`_preview` markers, and ``truncated`` is set.
+    """
     text = stable_json(envelope)
     if len(text) <= MAX_TOOL_MESSAGE_CHARS:
         return text
-    return text[: MAX_TOOL_MESSAGE_CHARS - 20] + ',"truncated":true}'
+    envelope = envelope if isinstance(envelope, dict) else {"data": envelope}
+    bounded: dict = {}
+    for key in ("ok", "error", "fatal"):
+        if key in envelope:
+            bounded[key] = envelope[key]
+    data = envelope.get("data")
+    if isinstance(data, dict):
+        kept: dict = {}
+        budget = MAX_TOOL_MESSAGE_CHARS - 40
+        for key, item in data.items():
+            if len(stable_json({**bounded, "data": {**kept, key: item}})) <= budget:
+                kept[key] = item
+            else:
+                kept[key] = _preview(item)
+        bounded["data"] = kept
+    else:
+        bounded["data"] = _preview(data)
+    bounded["truncated"] = True
+    text = stable_json(bounded)
+    if len(text) > MAX_TOOL_MESSAGE_CHARS:
+        # Even previews can overflow (many keys): keep status fields only.
+        bounded = {key: bounded[key] for key in ("ok", "error", "fatal") if key in bounded}
+        bounded["truncated"] = True
+        text = stable_json(bounded)
+    return text
+
+
+def _active_user_id(context: dict) -> str:
+    request = context.get("request") if isinstance(context.get("request"), dict) else {}
+    for value in (context.get("user_id"), request.get("user_id")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _scoped_tool_args(name: str, args, context: dict):
+    """Force tool arguments onto the active request's scope.
+
+    The model's own ids are never trusted: another user's (or request's) data
+    must not reach a remote model, and the verifier only guarantees the output
+    fields, not what the model managed to read on the way there.
+
+    Returns ``(scoped_args, overrides, error)``.  ``error`` is set when the tool
+    must fail closed instead of being dispatched.
+    """
+    scoped = dict(args) if isinstance(args, dict) else {}
+    overrides: dict = {}
+
+    if name in USER_SCOPED_TOOLS:
+        user_id = _active_user_id(context)
+        if not user_id:
+            if name == "search_evidence":
+                return scoped, overrides, (
+                    "no active user_id for this request; evidence search is refused"
+                )
+            overrides["user_id"] = {"requested": scoped.get("user_id"), "applied": ""}
+            scoped["user_id"] = ""
+        else:
+            if str(scoped.get("user_id") or "") != user_id:
+                overrides["user_id"] = {"requested": scoped.get("user_id"), "applied": user_id}
+            scoped["user_id"] = user_id
+
+    if name in REQUEST_SCOPED_TOOLS:
+        request_id = str(context.get("request_id") or "").strip()
+        if request_id:
+            if str(scoped.get("request_id") or "") != request_id:
+                overrides["request_id"] = {
+                    "requested": scoped.get("request_id"),
+                    "applied": request_id,
+                }
+            scoped["request_id"] = request_id
+
+    if name in REQUEST_FILTER_TOOLS and "request_id" in scoped:
+        request_id = str(context.get("request_id") or "").strip()
+        if request_id and str(scoped.get("request_id") or "") != request_id:
+            overrides["request_id"] = {
+                "requested": scoped.get("request_id"),
+                "applied": request_id,
+            }
+            scoped["request_id"] = request_id
+
+    return scoped, overrides, None
 
 
 def _facts_prompt(context: dict) -> str:
@@ -670,6 +783,20 @@ def run_agent_loop(
             return fallback(
                 f"provider call budget exhausted ({budget.provider_calls}/{budget.provider_limit} turns)"
             )
+        # The per-run cap (BUY_WAIT_LLM_MAX_CALLS) lives on the provider because
+        # one provider instance serves every request in a run.
+        reserve = getattr(provider, "reserve_call", None)
+        if callable(reserve) and not reserve():
+            cap = getattr(provider, "max_calls", DEFAULT_MAX_CALLS)
+            if enabled:
+                trace.record(
+                    "provider_budget_exhausted",
+                    {"calls_used": getattr(provider, "calls_used", None), "cap": cap},
+                )
+            return fallback(
+                "provider call budget exhausted for this run "
+                f"(BUY_WAIT_LLM_MAX_CALLS={cap}); the deterministic kernel row stands"
+            )
         # Counted before the call: a failing provider still consumes budget, so
         # a flapping endpoint cannot be retried forever.
         budget.provider_calls += 1
@@ -748,6 +875,45 @@ def run_agent_loop(
                     messages.append(_tool_reply(rest_id, {"ok": False, "error": reason}))
 
             budget.tool_calls += 1
+
+            # Allowlist before anything else: the schema list is advisory, the
+            # dispatch gate is what stops verify_decision/search_messages or any
+            # future toolbox method from being called by a model.
+            if name not in AGENT_TOOLS:
+                envelope = {
+                    "ok": False,
+                    "fatal": False,
+                    "error": f"tool {name!r} is not available to the agent",
+                }
+                state["failures"]["__not_allowlisted__"] = (
+                    state["failures"].get("__not_allowlisted__", 0) + 1
+                )
+                if enabled:
+                    trace.record(
+                        "tool_rejected",
+                        {"name": name, "error": envelope["error"]},
+                    )
+                messages.append(_tool_reply(tool_call_id, envelope))
+                if state["failures"]["__not_allowlisted__"] > 1:
+                    return fallback(
+                        f"model asked for tools that are not available ({name!r}); "
+                        "the agent stops"
+                    )
+                continue
+
+            scoped_args, overrides, scope_error = _scoped_tool_args(name, args, context)
+            if overrides and enabled:
+                trace.record("tool_scope", {"tool": name, "overrides": overrides})
+            if scope_error is not None:
+                envelope = {"ok": False, "fatal": False, "error": scope_error}
+                state["failures"][name] = state["failures"].get(name, 0) + 1
+                if enabled:
+                    trace.record("tool_error", {"name": name, "error": scope_error})
+                messages.append(_tool_reply(tool_call_id, envelope))
+                if state["failures"][name] > 1:
+                    return fallback(f"tool {name} refused twice ({scope_error})")
+                continue
+            args = scoped_args
 
             if name == "propose_decision":
                 candidate_payload = args.get("candidate") if "candidate" in args else args

@@ -495,7 +495,9 @@ class LocalStore:
             clauses.append("c.user_id = ?")
             params.append(str(user_id))
         if request_id:
-            clauses.append("c.request_id = ?")
+            # Event chunks (and most messages) carry no request id; they are
+            # user-level evidence and must survive a request-scoped query.
+            clauses.append("(c.request_id = ? OR c.request_id = '')")
             params.append(str(request_id))
         where = " AND ".join(["evidence_fts MATCH ?"] + clauses)
         sql = (
@@ -518,7 +520,7 @@ class LocalStore:
             clauses.append("c.user_id = ?")
             params.append(str(user_id))
         if request_id:
-            clauses.append("c.request_id = ?")
+            clauses.append("(c.request_id = ? OR c.request_id = '')")
             params.append(str(request_id))
         sql = (
             "SELECT c.chunk_id, c.source_type, c.source_id, c.user_id, c.request_id, "
@@ -540,14 +542,18 @@ class LocalStore:
         return hits
 
     def chunks(self, *, user_id=None, request_id=None, limit: int | None = None) -> list[dict]:
-        """Citation chunks (optionally scoped) in stable chunk-id order."""
+        """Citation chunks (optionally scoped) in stable chunk-id order.
+
+        A ``request_id`` filter keeps chunks bound to that request *and* chunks
+        with no request id (event-level evidence), mirroring the FTS query.
+        """
         clauses = []
         params: list = []
         if user_id:
             clauses.append("user_id = ?")
             params.append(str(user_id))
         if request_id:
-            clauses.append("request_id = ?")
+            clauses.append("(request_id = ? OR request_id = '')")
             params.append(str(request_id))
         sql = (
             "SELECT chunk_id, source_type, source_id, user_id, request_id, text, metadata_json "
