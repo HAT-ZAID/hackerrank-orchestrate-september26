@@ -395,12 +395,16 @@ def _fact_date(text: str, cue: re.Pattern[str]) -> str | None:
     cue_matches = []
     for date_cue in (_CREDIT_CUE, _EFFECTIVE_CUE, _PAYMENT_DATE_CUE):
         cue_matches.extend(date_cue.finditer(region))
-    for candidate in sorted(cue_matches, key=lambda found: found.start()):
+    ordered = sorted(cue_matches, key=lambda found: found.start())
+    for index, candidate in enumerate(ordered):
         # A negated date cue ("will not be paid on 2026-03-20") is not a date for
         # this fact; keep looking for the first affirmative one.
         if negation_before(region, candidate.start()):
             continue
-        date_match = _ISO_DATE.search(region[candidate.end() :])
+        # Only look up to the next cue: a later cue's date belongs to that cue,
+        # never to this one.
+        stop = ordered[index + 1].start() if index + 1 < len(ordered) else len(region)
+        date_match = _ISO_DATE.search(region[candidate.end() : stop])
         if date_match:
             return date_match.group(1)
     return None

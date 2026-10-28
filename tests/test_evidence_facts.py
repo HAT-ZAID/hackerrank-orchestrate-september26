@@ -197,6 +197,24 @@ def test_negated_payment_date_is_skipped_for_the_affirmative_one():
     assert final["settlement_date"] == "2026-04-01", final
 
 
+def test_affirmative_cue_does_not_borrow_the_next_cue_date():
+    # The first cue has no date of its own before the next cue; the date after the
+    # negated cue must not be pulled backwards onto the affirmative one.
+    facts = parse_messages(
+        "u1",
+        _messages([
+            _msg(
+                "m1",
+                "Your employment has ended. The final settlement of USD 500 is scheduled for "
+                "a later date, not scheduled for 2026-03-20 but scheduled for 2026-04-01. "
+                "Payroll ref EMP-0106.",
+            )
+        ]),
+    )
+    final = next(c for c in facts["salary_changes"] if c["kind"] == "final")
+    assert final["settlement_date"] == "2026-04-01", final
+
+
 def test_employment_and_contract_end_are_stop_signals_not_income():
     df = _messages([
         _msg(
