@@ -110,15 +110,29 @@ def _next_scheduled_salary_row(events, user_id, not_before: str):
     return sorted(candidates, key=_salary_row_date)[0]
 
 
-def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) -> list[dict]:
-    """Apply typed salary facts to the oracle copy; return what was applied.
+def _salary_change_warning(change: dict, detail: str) -> dict:
+    return {
+        "message_id": str(change.get("source_message_id") or ""),
+        "flag": "SALARY_CHANGE_NOT_APPLIED",
+        "kind": str(change.get("kind") or ""),
+        "date": str(change.get("effective_date") or change.get("settlement_date") or ""),
+        "detail": detail,
+    }
+
+
+def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) -> tuple[list[dict], list[dict]]:
+    """Apply typed salary facts to the oracle copy; return (applied, warnings).
 
     A dated change amends the salary row on that date, or injects a confirmed
     income row for kinds that legitimately create income. An undated "next
     payroll" change only amends the next scheduled salary row: it never invents
-    a payment date.
+    a payment date. A change that matches no row and cannot be injected is
+    reported in ``warnings`` so it is never silently dropped. Changes dated
+    beyond the 90-day horizon are skipped by design (they cannot affect this
+    request) and are not reported as data loss.
     """
     applied: list[dict] = []
+    warnings: list[dict] = []
     request_day = str(req_date or "").strip()
     try:
         window_end = date.fromisoformat(request_day) + timedelta(days=90)
@@ -137,6 +151,9 @@ def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) ->
             try:
                 target_date = date.fromisoformat(str(target).strip())
             except Exception:
+                warnings.append(
+                    _salary_change_warning(change, "unparsable salary change date")
+                )
                 continue
             if window_end is not None and target_date > window_end:
                 continue
@@ -150,14 +167,21 @@ def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) ->
                 applied.append({"kind": kind, "date": target_s, "amount": str(amount),
                                 "source_message_id": change.get("source_message_id", ""),
                                 "mode": "injected"})
+            else:
+                warnings.append(
+                    _salary_change_warning(
+                        change, f"no salary row on {target_s} to amend; not injected by kind"
+                    )
+                )
             continue
 
         # Undated reduction/temporary/confirmation: amend the next payroll row
         # only. No row means no application (never invent a salary payment).
-        if not request_day:
-            continue
-        row = _next_scheduled_salary_row(events, user_id, request_day)
+        row = _next_scheduled_salary_row(events, user_id, request_day) if request_day else None
         if row is None:
+            warnings.append(
+                _salary_change_warning(change, "no upcoming salary row to amend; no date stated")
+            )
             continue
         row_date = _salary_row_date(row)
         row["amount"] = str(amount)
@@ -166,7 +190,7 @@ def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) ->
         applied.append({"kind": kind, "date": row_date, "amount": str(amount),
                         "source_message_id": change.get("source_message_id", ""),
                         "mode": "amended"})
-    return applied
+    return applied, warnings
 
 
 def _evidence_notes(facts: dict) -> list[str]:
@@ -322,7 +346,7 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
                 _pre_injection = _copy.deepcopy(events_for_oracle)
             except Exception:
                 _pre_injection = [dict(e) for e in events_for_oracle]
-            applied_changes = _apply_salary_changes(
+            applied_changes, salary_warnings = _apply_salary_changes(
                 events_for_oracle, facts.get("salary_changes", []), user_id, profile, req_date
             )
             evidence = {
@@ -333,7 +357,9 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
                 "event_updates": facts.get("event_updates", []),
                 "applied_salary_changes": applied_changes,
                 "event_amendment_notes": amendment_warnings,
-                "warnings": list(facts.get("warnings", [])) + list(amendment_warnings),
+                "warnings": list(facts.get("warnings", []))
+                + list(amendment_warnings)
+                + list(salary_warnings),
                 "notes": _evidence_notes(facts),
             }
         else:

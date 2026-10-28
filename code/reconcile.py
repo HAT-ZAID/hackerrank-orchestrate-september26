@@ -34,6 +34,12 @@ CONFLICT_ORDER = (
 )
 
 _CANCEL_CUE = re.compile(r"\bcancell?ed\b|dibatalkan|pembatalan", re.IGNORECASE)
+_NEGATED_CANCEL_CUE = re.compile(
+    r"\bnot (?:been )?cancell?ed\b|\bnever (?:been )?cancell?ed\b"
+    r"|\bhas ?n[o']t been cancell?ed\b|\bwas ?n[o']t cancell?ed\b"
+    r"|tidak (?:pernah )?dibatalkan|belum dibatalkan",
+    re.IGNORECASE,
+)
 _SETTLE_CUE = re.compile(
     r"has reached your account|proceeds have settled|has settled in the cash account"
     r"|payment was received|has been credited|already credited"
@@ -129,7 +135,7 @@ def amendment_from_message(message: dict) -> dict | None:
     amount, currency = _amount_from_text(text)
     date = _date_from_text(text)
 
-    if _CANCEL_CUE.search(text):
+    if _CANCEL_CUE.search(text) and not _NEGATED_CANCEL_CUE.search(text):
         action, new_status = "cancelled", "cancelled"
     elif _SETTLE_CUE.search(text):
         action, new_status = "settled", "settled"

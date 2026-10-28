@@ -97,6 +97,27 @@ def test_salary_raise_and_reduction_are_typed_facts():
     ]
 
 
+def test_end_settlement_dates_are_anchored_to_their_own_fact():
+    # Two dated facts in one message: each must keep its own date, not the first one.
+    facts = parse_messages(
+        "u1",
+        _messages([
+            _msg(
+                "m1",
+                "Your employment has ended. The remaining confirmed monthly salary is USD 800 "
+                "and is confirmed for 2026-02-10. The final settlement of USD 500 is scheduled "
+                "for 2026-03-20. Payroll ref EMP-0101.",
+            )
+        ]),
+    )
+    by_kind = {
+        c["kind"]: c["settlement_date"]
+        for c in facts["salary_changes"]
+        if c["kind"] in {"confirmation", "final"}
+    }
+    assert by_kind == {"confirmation": "2026-02-10", "final": "2026-03-20"}, by_kind
+
+
 def test_employment_and_contract_end_are_stop_signals_not_income():
     df = _messages([
         _msg(
@@ -282,6 +303,32 @@ def test_reconcile_supports_cancellation_settlement_and_date_amendment():
     assert amended[0]["status"] == "pending", "a retried failed debit still reserves cash"
 
 
+def test_negated_cancellation_does_not_cancel_the_event():
+    from code.reconcile import amendment_from_message, reconcile_events
+
+    pending = {
+        "event_id": "e1",
+        "amount": "1000",
+        "status": "pending",
+        "currency": "USD",
+        "direction": "debit",
+    }
+    messages = [
+        _msg(
+            "m1",
+            "Here is the latest update on your bill. This invoice was not cancelled "
+            "and is still pending. Order ref MER-0200.",
+            related="e1",
+            sent_at="2025-01-02T00:00:00Z",
+        )
+    ]
+    intent = amendment_from_message(messages[0])
+    assert intent["action"] == "pending", f"got {intent}"
+
+    amended, _ = reconcile_events([pending], [intent])
+    assert amended[0]["status"] == "pending", "a negated cancellation must not cancel"
+
+
 def test_reconcile_warns_instead_of_misapplying():
     from code.reconcile import amendment_from_message, reconcile_events
 
@@ -412,6 +459,35 @@ def _machine(result) -> dict:
             "spending_changes_needed",
         )
     }
+
+
+def test_unmatched_dated_salary_change_is_reported_not_applied():
+    from code.solver import solve_request
+
+    profile = _profile(balance="3000")
+    events = [
+        _event("ev_salary", "income", "salary", "credit", "2000", "2026-02-15"),
+        _event("ev_rent", "expense", "rent", "debit", "2500", "2026-03-01"),
+    ]
+    # Dated reduction for 2026-02-20: no salary row exists on that date.
+    message = _msg(
+        "m1",
+        "Hi, payroll here. Your next salary is reduced to USD 800, effective from "
+        "2026-02-20. The adjustment is due to approved unpaid leave. Payroll ref EMP-0006.",
+        sent_at="2026-01-02T00:00:00Z",
+    )
+    before = solve_request(
+        "r1", "u1", "2026-01-01", "3000", profile, events, [], _empty_options(), None, None, False
+    )
+    after = solve_request(
+        "r1", "u1", "2026-01-01", "3000", profile, events, [], _empty_options(),
+        _messages([message]), None, False,
+    )
+
+    assert _machine(after) == _machine(before), "an unmatched change must not be applied"
+    flags = [warning["flag"] for warning in after["evidence"]["warnings"]]
+    assert "SALARY_CHANGE_NOT_APPLIED" in flags, f"got {after['evidence']['warnings']}"
+    assert not after["evidence"]["applied_salary_changes"]
 
 
 def test_solver_applies_a_reduction_fact_to_scheduled_income():

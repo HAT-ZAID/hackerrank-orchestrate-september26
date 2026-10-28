@@ -361,6 +361,29 @@ def _date_after(text: str, cue: re.Pattern[str]) -> str | None:
     return date_match.group(1) if date_match else None
 
 
+def _sentence_at(text: str, position: int) -> str:
+    """The sentence of ``text`` that contains ``position``."""
+    start = 0
+    for stop in _SENTENCE_END.finditer(text):
+        if stop.start() >= position:
+            return text[start : stop.start()]
+        start = stop.end()
+    return text[start:]
+
+
+def _date_in_sentence(text: str, cue: re.Pattern[str]) -> str | None:
+    """First ISO date in the same sentence as ``cue``.
+
+    Anchoring on the cue's own sentence keeps two dated facts in one message from
+    inheriting the first date that appears anywhere in the text.
+    """
+    match = cue.search(text)
+    if not match:
+        return None
+    date_match = _ISO_DATE.search(_sentence_at(text, match.start()))
+    return date_match.group(1) if date_match else None
+
+
 def _lang(text: str) -> str:
     return "id" if _INDONESIAN.search(text) else ""
 
@@ -443,7 +466,8 @@ def _extract_salary_changes(text: str, message_id: str) -> list[SalaryChange]:
                     amount=remaining_amount,
                     currency=remaining_currency or "",
                     effective_date=None,
-                    settlement_date=_date_after(text, _CREDIT_CUE),
+                    settlement_date=_date_in_sentence(text, _REMAINING_SALARY)
+                    or _date_in_sentence(text, _CREDIT_CUE),
                     confirmed=True,
                     source_message_id=message_id,
                     scope="remaining",
@@ -457,7 +481,8 @@ def _extract_salary_changes(text: str, message_id: str) -> list[SalaryChange]:
                     amount=final_amount,
                     currency=final_currency or "",
                     effective_date=None,
-                    settlement_date=_date_after(text, _CREDIT_CUE),
+                    settlement_date=_date_in_sentence(text, _FINAL_PAYMENT)
+                    or _date_in_sentence(text, _CREDIT_CUE),
                     confirmed=True,
                     source_message_id=message_id,
                     scope="final",
