@@ -6,4 +6,8 @@ __pycache__/
 code.zip
 .ua/
 .superpowers/
+.opencode/
+.env
+.env.*
+!.env.example
 
