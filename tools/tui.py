@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -65,11 +65,16 @@ STATUS_STYLES = {
     "affordable_later": "cyan",
     "not_affordable": "red",
 }
+METHODS = ("full_payment", "partial_payment", "installments", "wait", "not_recommended")
+ATTENTION_LIMIT = 10
+MANUAL_PREFIX = "manual_"
 
 HELP_TEXT = """\
 Commands:
   list [status]         table of requests; a status filter solves all first
   show <id>             decision panel + ledger + floor breaches + options
+  dashboard             output.csv snapshot: counts, methods, needs attention
+  new                   ask a new question for an existing user (session only)
   whatif <id> k=v ...   set overrides, re-solve, print the before/after diff
   changes <id>          candidate actions with each one's projected effect
   apply <id> <action>   try one candidate in-session, re-solve, show delta
@@ -82,6 +87,8 @@ Commands:
 whatif fields:  amount=<N>  date=<YYYY-MM-DD>  floor=<N>
                 (requested_amount, request_date, minimum_balance_to_keep)
 actions:        stop:<event_id>  or  reduce_to:<event_id>:<new_amount>
+`dashboard` reads the existing output.csv snapshot and never re-solves the
+batch; `new` adds an in-memory manual_0001-style request and solves only that.
 Edits are session-only: output.csv and dataset/ are never written."""
 
 
@@ -177,6 +184,193 @@ def render_decision(row: dict) -> str:
     buffer = io.StringIO()
     console = Console(
         file=buffer, width=100, force_terminal=False, highlight=False, markup=False
+    )
+    console.print(panel)
+    return buffer.getvalue()
+
+
+def read_output_snapshot(path, expected_ids):
+    """Read the existing ``output.csv`` snapshot and validate it.
+
+    Returns ``(rows, "")`` when the file covers exactly ``expected_ids`` and
+    ``(None, message)`` otherwise. ``dashboard`` reports the message instead of
+    fabricating a summary or solving the whole batch.
+    """
+    import pandas as pd
+
+    snapshot = Path(path)
+    name = snapshot.name or str(snapshot)
+    if not snapshot.exists():
+        return None, (
+            f"no {name} snapshot at {snapshot}; run the pipeline first "
+            "(dashboard never solves the full batch)."
+        )
+    try:
+        frame = pd.read_csv(snapshot, dtype=str, keep_default_na=False)
+    except Exception as exc:
+        return None, (
+            f"could not read {name}: {type(exc).__name__}: {exc}; "
+            "run the pipeline to regenerate it."
+        )
+    if "request_id" not in frame.columns:
+        return None, (
+            f"{name} has no request_id column; run the pipeline to regenerate it."
+        )
+    written = {str(value) for value in frame["request_id"]}
+    expected = {str(value) for value in expected_ids or ()}
+    if written != expected or len(frame) != len(expected):
+        missing = len(expected - written)
+        unknown = len(written - expected)
+        duplicate = max(len(frame) - len(written), 0)
+        detail = f"{missing} missing, {unknown} unknown"
+        if duplicate:
+            detail += f", {duplicate} duplicate row(s)"
+        return None, (
+            f"{name} does not match the dataset request set ({detail}); "
+            "it is a stale snapshot -- run the pipeline before using `dashboard`."
+        )
+    return frame.to_dict("records"), ""
+
+
+def _attention_key(entry) -> tuple:
+    amount = entry.get("requested_amount")
+    return (
+        amount is None,
+        -(amount if amount is not None else Decimal("0")),
+        str(entry.get("request_id", "")),
+    )
+
+
+def dashboard_summary(requests, decisions, limit: int = ATTENTION_LIMIT) -> dict:
+    """Pure aggregation for the dashboard: counts plus a needs-attention list.
+
+    ``requests`` supplies the requested amounts; ``decisions`` supplies the
+    output fields. Rows without a decision are counted, never guessed.
+    """
+    by_id = {
+        str(decision.get("request_id", "")): decision
+        for decision in decisions or ()
+        if decision
+    }
+    by_status = dict.fromkeys(STATUSES, 0)
+    by_method = dict.fromkeys(METHODS, 0)
+    spending_changes = 0
+    zero_safe = 0
+    fail_closed = 0
+    missing = 0
+    attention = []
+    for request in requests or ():
+        request_id = str(request.get("request_id", ""))
+        decision = by_id.get(request_id)
+        if decision is None:
+            missing += 1
+            continue
+        status = _as_text(decision.get("affordability_status")).strip()
+        method = _as_text(decision.get("recommended_payment_method")).strip()
+        by_status[status] = by_status.get(status, 0) + 1
+        by_method[method] = by_method.get(method, 0) + 1
+        changes = _as_text(decision.get("spending_changes_needed")).strip()
+        if changes and changes.lower() != "none":
+            spending_changes += 1
+        safe = _as_decimal(decision.get("amount_safe_to_pay"))
+        if safe is not None and safe == 0:
+            zero_safe += 1
+        if status == "not_affordable" and method == "not_recommended" and (
+            safe is None or safe == 0
+        ):
+            fail_closed += 1
+        attention.append(
+            {
+                "request_id": request_id,
+                "requested_amount": _as_decimal(request.get("requested_amount")),
+                "amount_safe_to_pay": safe,
+                "affordability_status": status,
+                "recommended_payment_method": method,
+            }
+        )
+    attention.sort(key=_attention_key)
+    return {
+        "total": len(requests or ()),
+        "by_status": by_status,
+        "by_method": by_method,
+        "spending_changes": spending_changes,
+        "zero_safe": zero_safe,
+        "fail_closed": fail_closed,
+        "missing_decisions": missing,
+        "attention": attention[:limit],
+        "attention_limit": limit,
+    }
+
+
+def render_dashboard(summary, source_label=None, manual_note=None) -> str:
+    """Render a dashboard summary to plain text (no terminal required)."""
+    source = summary or {}
+    counts = Table(title="dashboard", show_header=False, box=None, pad_edge=False)
+    counts.add_column("metric", style="bold")
+    counts.add_column("value", justify="right")
+    counts.add_column("detail")
+    counts.add_row("requests", str(source.get("total", 0)), "")
+    for status in STATUSES:
+        counts.add_row(
+            f"  {status}",
+            str((source.get("by_status") or {}).get(status, 0)),
+            "",
+            style=STATUS_STYLES.get(status),
+        )
+    for method in METHODS:
+        counts.add_row(
+            f"  {method}", str((source.get("by_method") or {}).get(method, 0)), ""
+        )
+    counts.add_row(
+        "spending changes",
+        str(source.get("spending_changes", 0)),
+        "rows with spending_changes_needed other than none",
+    )
+    counts.add_row(
+        "zero-safe rows",
+        str(source.get("zero_safe", 0)),
+        f"fail-closed (not_affordable + not_recommended): {source.get('fail_closed', 0)}",
+    )
+    if source.get("missing_decisions"):
+        counts.add_row(
+            "no decision", str(source.get("missing_decisions", 0)), "not in the snapshot"
+        )
+
+    attention = Table(
+        title=(
+            f"needs attention (up to {source.get('attention_limit', ATTENTION_LIMIT)}, "
+            "largest request first)"
+        )
+    )
+    attention.add_column("request_id")
+    attention.add_column("requested", justify="right")
+    attention.add_column("safe", justify="right")
+    attention.add_column("status")
+    attention.add_column("method")
+    for entry in source.get("attention") or ():
+        attention.add_row(
+            str(entry.get("request_id", "")),
+            _money(entry.get("requested_amount")),
+            _money(entry.get("amount_safe_to_pay")),
+            str(entry.get("affordability_status", "")),
+            str(entry.get("recommended_payment_method", "")),
+            style=STATUS_STYLES.get(str(entry.get("affordability_status", ""))),
+        )
+
+    footer = Text()
+    footer.append(source_label or "in-memory decisions", style="dim")
+    if manual_note:
+        footer.append("\n")
+        footer.append(manual_note, style="yellow")
+    panel = Panel(
+        Group(counts, attention, footer),
+        title="Buy or Wait? dashboard",
+        title_align="left",
+        border_style="blue",
+    )
+    buffer = io.StringIO()
+    console = Console(
+        file=buffer, width=110, force_terminal=False, highlight=False, markup=False
     )
     console.print(panel)
     return buffer.getvalue()
@@ -432,6 +626,9 @@ class TUI:
         # signature, so edits to one request never invalidate another.
         self._cache: dict[str, tuple[str, dict]] = {}
         self._originals: dict[str, tuple[str, dict]] = {}
+        # Session-only manual requests (llm-free, never written to disk).
+        self._manual_ids: set[str] = set()
+        self._manual_counter = 0
 
     # -- plumbing ----------------------------------------------------------
 
@@ -520,6 +717,100 @@ class TUI:
         self.console.print(table)
 
     # -- commands ----------------------------------------------------------
+
+    def manual_requests(self) -> list[str]:
+        """IDs created by `new` in this session (never the dataset rows)."""
+        requests = (self.data or {}).get("requests") or []
+        return [
+            str(request.get("request_id", ""))
+            for request in requests
+            if str(request.get("request_id", "")) in self._manual_ids
+        ]
+
+    def _next_manual_id(self, data) -> str:
+        existing = {str(request.get("request_id", "")) for request in data["requests"]}
+        index = self._manual_counter
+        while True:
+            index += 1
+            candidate = f"{MANUAL_PREFIX}{index:04d}"
+            if candidate not in existing:
+                self._manual_counter = index
+                return candidate
+
+    def _prompt(self, label, default=None) -> str:
+        hint = f" [{default}]" if default is not None else ""
+        raw = self.input_fn(f"{label}{hint}: ")
+        text = "" if raw is None else str(raw).strip()
+        if not text and default is not None:
+            return str(default)
+        return text
+
+    @staticmethod
+    def _parse_date(value):
+        try:
+            return date.fromisoformat(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _prompt_manual(self, data) -> dict | None:
+        """Interactive prompt sequence; returns the row or None (no state change)."""
+        user_id = self._prompt("user_id")
+        if not user_id:
+            self.console.print("user_id is required", style="red")
+            return None
+        if user_id not in data["profiles"]:
+            known = sorted(data["profiles"])
+            shown = ", ".join(known[:8]) + (" ..." if len(known) > 8 else "")
+            self.console.print(
+                f"unknown user {user_id!r} -- known users: {shown}", style="red"
+            )
+            return None
+        raw_date = self._prompt("request_date (YYYY-MM-DD)")
+        request_date = self._parse_date(raw_date)
+        if request_date is None:
+            self.console.print(
+                f"request_date must be YYYY-MM-DD, got {raw_date!r}", style="red"
+            )
+            return None
+        raw_amount = self._prompt("requested_amount")
+        amount = _as_decimal(raw_amount)
+        if amount is None or amount <= 0:
+            self.console.print(
+                f"requested_amount must be a positive decimal, got {raw_amount!r}",
+                style="red",
+            )
+            return None
+        completion = self._prompt(
+            "desired_completion_date (YYYY-MM-DD)", default=request_date.isoformat()
+        )
+        completion_date = self._parse_date(completion)
+        if completion_date is None:
+            self.console.print(
+                f"desired_completion_date must be YYYY-MM-DD, got {completion!r}",
+                style="red",
+            )
+            return None
+        if completion_date < request_date:
+            self.console.print(
+                f"desired_completion_date {completion_date.isoformat()} is before "
+                f"request_date {request_date.isoformat()}; nothing created",
+                style="red",
+            )
+            return None
+        partial = self._prompt("allows_partial_payment y/N", default="n").lower()
+        request_type = self._prompt("request_type", default="other") or "other"
+        request_text = self._prompt("request_text (optional)")
+        return {
+            "user_id": user_id,
+            "request_date": request_date.isoformat(),
+            "request_type": request_type,
+            "requested_amount": str(amount),
+            "desired_completion_date": completion_date.isoformat(),
+            "allows_partial_payment": "true"
+            if partial in ("y", "yes", "true")
+            else "false",
+            "request_text": request_text,
+        }
 
     def cmd_help(self, args) -> None:
         self.console.print(HELP_TEXT)
@@ -612,6 +903,106 @@ class TUI:
                 "solves all requests, `show <id>` solves one.",
                 style="dim",
             )
+
+    def cmd_dashboard(self, args) -> None:
+        if args:
+            self.console.print("usage: dashboard", style="red")
+            return
+        data = self._ensure_data()
+        if data is None:
+            return
+        baseline = [
+            request
+            for request in data["requests"]
+            if str(request.get("request_id", "")) not in self._manual_ids
+        ]
+        rows, message = read_output_snapshot(
+            REPO_ROOT / "output.csv",
+            [request.get("request_id", "") for request in baseline],
+        )
+        manual_ids = self.manual_requests()
+        manual_note = ""
+        if manual_ids:
+            manual_note = (
+                f"session-only manual requests: {len(manual_ids)} "
+                f"({', '.join(manual_ids)}) -- not in output.csv"
+            )
+        if rows is None:
+            self.console.print(message, style="yellow")
+            if manual_note:
+                self.console.print(manual_note, style="yellow")
+                self._print_manual_table(manual_ids)
+            return
+        summary = dashboard_summary(baseline, rows)
+        self.console.print(
+            render_dashboard(
+                summary,
+                source_label=(
+                    f"output.csv snapshot ({len(rows)} rows) -- "
+                    "not recomputed in this session"
+                ),
+                manual_note=manual_note or None,
+            ),
+            soft_wrap=True,
+        )
+        if manual_ids:
+            self._print_manual_table(manual_ids)
+
+    def _print_manual_table(self, manual_ids) -> None:
+        table = Table(title="session-only manual requests")
+        table.add_column("request_id")
+        table.add_column("user")
+        table.add_column("date")
+        table.add_column("requested", justify="right")
+        table.add_column("status")
+        table.add_column("method")
+        for request_id in manual_ids:
+            request = lookup_request(self.data.get("requests") or [], request_id) or {}
+            decision = self._cached_decision(request_id) or {}
+            status = _as_text(decision.get("affordability_status"))
+            table.add_row(
+                request_id,
+                _as_text(request.get("user_id")),
+                _as_text(request.get("request_date")),
+                _money(request.get("requested_amount")),
+                status or "not solved",
+                _as_text(decision.get("recommended_payment_method")),
+                style=STATUS_STYLES.get(status),
+            )
+        self.console.print(table)
+
+    def cmd_new(self, args) -> None:
+        if args:
+            self.console.print(
+                "usage: new   (interactive; the request stays in this session)", style="red"
+            )
+            return
+        data = self._ensure_data()
+        if data is None:
+            return
+        try:
+            row = self._prompt_manual(data)
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("new cancelled -- no request created", style="yellow")
+            return
+        if row is None:
+            return
+        request_id = self._next_manual_id(data)
+        row = dict(row, request_id=request_id)
+        # The only place the in-memory request list is extended.
+        data["requests"].append(row)
+        self._manual_ids.add(request_id)
+        self.console.print(
+            f"created {request_id}: session-only, no CSV was written", style="green"
+        )
+        decision = self._decide(request_id)
+        if decision is None:
+            self.console.print(
+                "the manual request is listed but has no decision; `undo` does not remove it",
+                style="yellow",
+            )
+            return
+        self.console.print(render_decision(decision), soft_wrap=True)
 
     def cmd_show(self, args) -> None:
         request_id = self._one_id(args, "show")
@@ -989,6 +1380,8 @@ def run_tui(data=None, input_fn=input) -> None:
     handlers = {
         "list": app.cmd_list,
         "show": app.cmd_show,
+        "dashboard": app.cmd_dashboard,
+        "new": app.cmd_new,
         "whatif": app.cmd_whatif,
         "changes": app.cmd_changes,
         "apply": app.cmd_apply,
