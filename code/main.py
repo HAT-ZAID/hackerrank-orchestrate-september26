@@ -6,6 +6,7 @@ and writes output.csv.
 Run with: python -m code.main (from repo root)
 """
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 
@@ -113,6 +114,9 @@ def run_pipeline(
     output_path=None,
     write_output=True,
     write_usage=True,
+    provider=None,
+    trace_dir=None,
+    agent_request_ids=None,
 ):
     """Run the production pipeline and return ``(output_frame, usage)``.
 
@@ -120,6 +124,16 @@ def run_pipeline(
     production OCR/evidence resolution, strict installment safety, fail-closed
     rows, usage-report writing and LF line endings. The evaluation harness
     overrides only the request source and the write targets.
+
+    Agent options (Task 5A) are additive and off by default:
+
+    - ``agent_request_ids``: only these requests run through
+      :func:`code.agent.run_agent_once`; every other request keeps the plain
+      ``solve_request`` path.
+    - ``provider``: an optional decision provider (``None`` behaves as
+      ``NullProvider``). It can only propose; the kernel keeps ownership.
+    - ``trace_dir``: when set, one JSON trace per agent request is written under
+      ``trace_dir/<run_id>/<request_id>.json``. ``None`` writes nothing.
     """
     root = Path(repo_root).resolve() if repo_root is not None else REPO_ROOT
     ocr_path = configure_runtime()
@@ -144,6 +158,43 @@ def run_pipeline(
         ocr_available=ocr_path is not None,
     )
 
+    # Optional agent substrate (Task 5A). Built only when request ids are named,
+    # so the default run allocates nothing and writes no traces.
+    agent_ids = {
+        str(item).strip() for item in (agent_request_ids or ()) if str(item).strip()
+    }
+    agent_state = None
+    if agent_ids:
+        from code.agent import run_agent_once
+        from code.tools import DatasetBundle, Toolbox
+        from code.trace import TraceRecorder
+
+        run_id = "run-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        recorder = TraceRecorder(run_id, output_dir=trace_dir)
+        kernel_results: dict = {}
+        toolbox = Toolbox(
+            root,
+            data=DatasetBundle.from_frames(
+                requests=requests,
+                profiles=profiles,
+                events=events,
+                fx=fx,
+                options=options,
+                messages=messages,
+                images=images,
+                evidence_warnings=evidence_warnings,
+            ),
+            kernel_results=kernel_results,
+            trace=recorder,
+        )
+        agent_state = {
+            "ids": agent_ids,
+            "run": run_agent_once,
+            "toolbox": toolbox,
+            "recorder": recorder,
+            "kernel_results": kernel_results,
+        }
+
     # Prepare output rows
     output_rows = []
     usage = new_usage()
@@ -165,12 +216,50 @@ def run_pipeline(
                 installment_safety="strict",  # pin strict leg safety for production runs
             )
 
+        # Optional agent pass on top of the kernel row. The verifier always
+        # returns kernel values, so the row is identical to the plain path
+        # unless a valid, agreeing candidate supplied its own rationale.
+        agent_outcome = None
+        if agent_state is not None and req["request_id"] in agent_state["ids"]:
+            agent_state["kernel_results"][req["request_id"]] = res
+            agent_outcome = agent_state["run"](
+                {
+                    "request_id": req["request_id"],
+                    "user_id": user_id,
+                    "request": req.to_dict(),
+                    "profile": profile,
+                },
+                provider=provider,
+                tools=agent_state["toolbox"],
+                trace=agent_state["recorder"],
+                kernel_result=res,
+            )
+            res = agent_outcome["row"]
+
         # Format as output row
         safe_amount = _money(res["amount_safe_to_pay"])
         payment_plan = _money_plan(
             res["payment_plan"], safe_amount, req["requested_amount"],
             partial=res["recommended_payment_method"] == "partial_payment",
         )
+        explanation = generate_explanation({
+            "requested_amount": str(req["requested_amount"]),
+            "request_type": str(req["request_type"]),
+            "amount_safe_to_pay": safe_amount,
+            "affordability_status": res["affordability_status"],
+            "recommended_payment_method": res["recommended_payment_method"],
+            "payment_plan": payment_plan,
+            "earliest_date_for_full_payment": res["earliest_date_for_full_payment"] or "",
+            "minimum_balance": profile.get("minimum_balance_to_keep", ""),
+            "spending_changes_needed": res["spending_changes_needed"],
+            "evidence_warnings": user_warnings,
+            "_usage": usage,
+        })
+        if (
+            agent_outcome is not None
+            and agent_outcome["verification"].get("rationale_source") == "candidate"
+        ):
+            explanation = res.get("decision_explanation") or explanation
         output_row = {
             "request_id": res["request_id"],
             "amount_safe_to_pay": safe_amount,
@@ -179,19 +268,7 @@ def run_pipeline(
             "payment_plan": payment_plan,
             "earliest_date_for_full_payment": res["earliest_date_for_full_payment"],
             "spending_changes_needed": res["spending_changes_needed"],
-            "decision_explanation": generate_explanation({
-                "requested_amount": str(req["requested_amount"]),
-                "request_type": str(req["request_type"]),
-                "amount_safe_to_pay": safe_amount,
-                "affordability_status": res["affordability_status"],
-                "recommended_payment_method": res["recommended_payment_method"],
-                "payment_plan": payment_plan,
-                "earliest_date_for_full_payment": res["earliest_date_for_full_payment"] or "",
-                "minimum_balance": profile.get("minimum_balance_to_keep", ""),
-                "spending_changes_needed": res["spending_changes_needed"],
-                "evidence_warnings": user_warnings,
-                "_usage": usage,
-            })
+            "decision_explanation": explanation,
         }
         output_rows.append(output_row)
 

@@ -12,4 +12,5 @@ code.zip
 !.env.example
 evaluation/report.json
 evaluation/report.md
+traces/
 
