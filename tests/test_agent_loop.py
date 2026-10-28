@@ -684,6 +684,32 @@ def test_search_evidence_fails_closed_without_an_active_user(tmp_path):
     assert result.fallback_reason
 
 
+def test_get_financial_events_is_refused_without_an_active_user(tmp_path):
+    """Every user-scoped tool fails closed, not just search_evidence.
+
+    ``user_id=""`` would reach the store, whose queries may drop the user
+    predicate for an empty id, so the call must never be dispatched.
+    """
+    recorder = TraceRecorder("run-scope-events", tmp_path / "traces")
+    root = _tiny_repo(tmp_path)
+    toolbox = _toolbox(root, recorder=recorder)
+    context = _context()
+    context.pop("user_id")
+    context["request"].pop("user_id")
+    provider = _scripted(
+        [tool_calls(("get_financial_events", {"user_id": "user_attacker"}))]
+    )
+
+    result = run_agent_loop(context, provider=provider, tools=toolbox, trace=recorder)
+
+    trace = json.loads(Path(result.trace_path).read_text(encoding="utf-8"))
+    assert trace["tool_calls"] == []
+    errors = [event for event in trace["events"] if event["kind"] == "tool_error"]
+    assert errors and "no active user_id" in errors[0]["error"]
+    assert "user_attacker" not in errors[0]["error"]
+    assert result.fallback_reason
+
+
 def test_non_allowlisted_tools_are_rejected(tmp_path):
     recorder = TraceRecorder("run-allowlist", tmp_path / "traces")
     root = _tiny_repo(tmp_path)

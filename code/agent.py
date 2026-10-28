@@ -517,16 +517,15 @@ def _scoped_tool_args(name: str, args, context: dict):
     if name in USER_SCOPED_TOOLS:
         user_id = _active_user_id(context)
         if not user_id:
-            if name == "search_evidence":
-                return scoped, overrides, (
-                    "no active user_id for this request; evidence search is refused"
-                )
-            overrides["user_id"] = {"requested": scoped.get("user_id"), "applied": ""}
-            scoped["user_id"] = ""
-        else:
-            if str(scoped.get("user_id") or "") != user_id:
-                overrides["user_id"] = {"requested": scoped.get("user_id"), "applied": user_id}
-            scoped["user_id"] = user_id
+            # Never dispatch with an empty or attacker-supplied id: the store
+            # may drop the user predicate for an empty id, which would expose
+            # unscoped records.
+            return scoped, overrides, (
+                f"no active user_id for this request; {name} is refused"
+            )
+        if str(scoped.get("user_id") or "") != user_id:
+            overrides["user_id"] = {"requested": scoped.get("user_id"), "applied": user_id}
+        scoped["user_id"] = user_id
 
     if name in REQUEST_SCOPED_TOOLS:
         request_id = str(context.get("request_id") or "").strip()
