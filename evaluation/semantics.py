@@ -214,6 +214,7 @@ def parse_spending_changes(value) -> dict[tuple[str, str], ChangeAction]:
     if not text:
         return {}
     actions: dict[tuple[str, str], ChangeAction] = {}
+    targets: set[str] = set()
     for raw in text.split("|"):
         part = raw.strip()
         if not part:
@@ -229,10 +230,12 @@ def parse_spending_changes(value) -> dict[tuple[str, str], ChangeAction]:
             if not amount.is_finite():
                 raise ValueError(f"invalid spending-change amount {part!r}")
             action = ChangeAction("reduce_to", reduce_match.group(1), amount)
-        key = (action.kind, action.event_id)
-        if key in actions:
+        if action.event_id in targets:
             raise ValueError(f"duplicate spending-change target {action.event_id!r}")
-        actions[key] = action
+        if len(actions) >= 3:
+            raise ValueError("more than three spending-change actions")
+        targets.add(action.event_id)
+        actions[(action.kind, action.event_id)] = action
     return actions
 
 

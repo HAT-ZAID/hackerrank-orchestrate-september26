@@ -6,6 +6,10 @@ edge cases belong to the final verification pass near project completion.
 """
 from __future__ import annotations
 
+import csv
+
+import pytest
+
 from evaluation import semantics
 from evaluation import run as evalrun
 
@@ -132,3 +136,64 @@ def test_report_emission_is_stable(tmp_path):
     json_b, markdown_b = evalrun.write_reports(report_a, tmp_path / "b")
     assert json_a.read_bytes() == json_b.read_bytes()
     assert markdown_a.read_bytes() == markdown_b.read_bytes()
+
+
+def test_spending_changes_reject_conflicting_targets_and_action_cap():
+    with pytest.raises(ValueError):
+        semantics.parse_spending_changes("stop:event_1|reduce_to:event_1:5")
+    with pytest.raises(ValueError):
+        semantics.parse_spending_changes(
+            "stop:event_1|stop:event_2|stop:event_3|stop:event_4"
+        )
+
+
+def test_pr_production_pass_does_not_overwrite_submission_artifacts(tmp_path, monkeypatch):
+    import pandas as pd
+
+    root = tmp_path
+    sample_dir = root / "dataset"
+    sample_dir.mkdir()
+    sample_row = _row()
+    with (sample_dir / "sample_requests.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(sample_row))
+        writer.writeheader()
+        writer.writerow(sample_row)
+
+    calls = []
+
+    def fake_run_pipeline(repo_root=None, **kwargs):
+        calls.append({"repo_root": repo_root, **kwargs})
+        return pd.DataFrame([sample_row]), {}
+
+    monkeypatch.setattr("code.main.run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        evalrun,
+        "run_structural_checks",
+        lambda _root: (
+            evalrun.make_gate("G0", "structural", True, "PASS", "ok"),
+            {
+                "checks_total": 1,
+                "checks_passed": 1,
+                "checks_failed": 0,
+                "failed_checks": [],
+                "returncode": 0,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        evalrun,
+        "provenance_metrics",
+        lambda _root: {
+            "commit_sha": "abc123",
+            "output_sha256": "out",
+            "usage_report_sha256": "usage",
+            "usage_report_mirror_sha256": "usage",
+            "usage_report_mirrors_match": True,
+            "usage_report_fields_present": True,
+        },
+    )
+
+    evalrun.run_pr(root)
+
+    assert calls[0]["write_output"] is False
+    assert calls[0]["write_usage"] is False

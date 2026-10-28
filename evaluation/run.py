@@ -661,7 +661,11 @@ def run_pr(root: Path, provider: str = "replay") -> dict:
 
     with replay_environment(provider):
         try:
-            _, production_usage = run_pipeline(repo_root=root)
+            _, production_usage = run_pipeline(
+                repo_root=root,
+                write_output=False,
+                write_usage=False,
+            )
         except Exception as exc:  # fail closed: the report records the crash
             production_error = _exception_text(exc)
         if production_error is None:
