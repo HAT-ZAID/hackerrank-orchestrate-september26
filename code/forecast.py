@@ -537,25 +537,33 @@ def _income_forecast(
     )[-1]
     amount = latest["amount"]
 
-    existing: set[date] = set()
+    # Real countable salary rows already committed inside the window: they fill
+    # part of the occurrence cap and anchor the projection after their latest date.
+    real_dates: list[date] = []
     for event in events:
         if _norm(event.get("category")) not in PRIMARY_INCOME_CATEGORIES:
+            continue
+        if _norm(event.get("event_type")) != "income":
             continue
         event_day = _event_day(event)
         if event_day is None or not (req_date <= event_day <= window_end):
             continue
-        if _norm(event.get("direction")) == "non_cash":
+        if not _counts_as_history(event, income=True):
             continue
-        if _norm(event.get("status")) in _EXCLUDED_HISTORY_STATUSES:
-            continue
-        existing.add(event_day)
+        real_dates.append(event_day)
+    existing = set(real_dates)
+
+    remaining = MAX_INCOME_OCCURRENCES - len(real_dates)
+    if remaining <= 0:
+        return [], (description or None)
 
     entries: list[ForecastEntry] = []
-    next_date = max(dates) + timedelta(days=interval)
+    anchor = max(max(dates), max(real_dates)) if real_dates else max(dates)
+    next_date = anchor + timedelta(days=interval)
     while next_date < req_date:
         next_date += timedelta(days=interval)
     emitted = 0
-    while next_date <= window_end and emitted < MAX_INCOME_OCCURRENCES:
+    while next_date <= window_end and emitted < remaining:
         if next_date not in existing:
             entries.append(
                 ForecastEntry(

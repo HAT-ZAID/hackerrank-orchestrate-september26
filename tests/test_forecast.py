@@ -6,6 +6,7 @@ employment stops salary projection, only one primary salary stream is chosen,
 evidence expense facts move only their post-effective-date forecast, and an
 ambiguous ledger fails closed instead of returning a synthetic flat ledger.
 """
+from datetime import date
 from decimal import Decimal
 
 import pandas as pd
@@ -166,7 +167,50 @@ def test_rent_increase_fact_changes_only_post_effective_date_forecast():
     assert {entry.source for entry in after} == {"evidence"}
 
 
-# 6. solve_safe_amount returns fail_closed=True with an empty ledger on STATUS_UNKNOWN.
+# 6. Real in-window salary rows fill the occurrence cap and anchor the projection.
+def test_salary_projection_counts_real_in_window_rows_toward_cap():
+    history = _monthly(
+        "salary",
+        ("2025-10", "2025-11", "2025-12", "2026-01"),
+        amount="2000",
+        event_type="income",
+        direction="credit",
+        description="Payroll credit",
+    )
+    real_first = _event(
+        "salary_real_1",
+        "2026-02-10",
+        "salary",
+        "2000",
+        event_type="income",
+        direction="credit",
+        status="scheduled",
+        description="Payroll credit",
+    )
+    # One real row leaves room for exactly one projection, and that projection
+    # must be anchored after the real row, not on the cadence date from history.
+    result = build_forecast(history + [real_first], "2026-02-01")
+    projected = _entries(result, "income")
+    assert len(projected) == 1
+    assert projected[0].date > date(2026, 2, 10)
+    assert all(entry.date != date(2026, 2, 10) for entry in projected)
+
+    real_second = _event(
+        "salary_real_2",
+        "2026-02-27",
+        "salary",
+        "2000",
+        event_type="income",
+        direction="credit",
+        status="scheduled",
+        description="Payroll credit",
+    )
+    # Two real rows already fill the cap: no synthetic salary may be added.
+    result = build_forecast(history + [real_first, real_second], "2026-02-01")
+    assert _entries(result, "income") == []
+
+
+# 7. solve_safe_amount returns fail_closed=True with an empty ledger on STATUS_UNKNOWN.
 def test_oracle_fails_closed_with_empty_ledger_on_unknown_status():
     events = [_event("e1", "2026-01-02", "rent", "1000", status="unknown")]
     profile = {
