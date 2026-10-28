@@ -411,6 +411,17 @@ def test_first_bucket_is_not_prorated_without_a_projected_salary():
     assert first and first[0].amount == Decimal("-300")
 
 
+def test_prorated_first_bucket_never_exceeds_the_full_monthly_budget():
+    # 2026-01-01 is the 1st of a 31-day month, so (days_left + 1) / 30 = 32 / 30.
+    # The remaining share of a month can never exceed the whole month's budget.
+    result = build_forecast(_salary_history() + _groceries_history(), "2026-01-01")
+
+    assert _entries(result, "income"), "the fixture must project a salary"
+    first = [entry for entry in _budget_entries(result) if entry.date == date(2026, 1, 1)]
+    assert first, _budget_entries(result)
+    assert first[0].amount == Decimal("-300")
+
+
 def test_stop_removes_the_budget_and_a_protected_stop_is_ignored_with_a_warning():
     stopped = build_forecast(
         _groceries_history(), "2026-01-10", suppressed_categories={"groceries"}

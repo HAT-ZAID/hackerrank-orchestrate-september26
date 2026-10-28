@@ -432,9 +432,13 @@ def _monthly_budget_forecast(
         for category in sorted(budgets):
             amount = budgets[category]
             if first and has_projected_income:
-                amount = (
+                # The remaining share of a month can never exceed the whole
+                # month's budget: on the 1st/2nd of a 31-day month (or the 1st of
+                # a 30-day month) the inclusive day count pushes the factor above 1.
+                prorated = (
                     amount * Decimal(days_left + 1) / Decimal(PRORATION_DAYS_PER_MONTH)
                 )
+                amount = min(amount, prorated)
             covered = sum(
                 (value for day, value in real.get(category, ()) if cursor <= day < bucket_end),
                 Decimal(0),
