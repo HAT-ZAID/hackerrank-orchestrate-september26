@@ -181,8 +181,12 @@ def test_protected_split_strips_whitespace_and_nan():
 def test_missing_keys_do_not_crash():
     evs = [{"event_date": "2026-01-02", "settlement_date": "2026-01-02", "user_id": "u1"}]
     res = solve_safe_amount("u1", "2026-01-01", "15000", _profile(), evs, [], set())
-    assert res["safe_amount"] >= Decimal("0")
-    assert len(res["ledger"]) == 91
+    # Task 3 contract: a row that cannot be classified is ambiguous. It must
+    # not crash, and it must not be silently ignored either.
+    assert res["safe_amount"] == Decimal("0")
+    assert res["ledger"] == []
+    assert res["fail_closed"] is True
+    assert res["fail_closed_reason"] == "STATUS_UNKNOWN"
 
 
 def test_pending_debit_posts_on_settlement_date():

@@ -228,7 +228,7 @@ def test_solver_threads_recurrence_flags(monkeypatch):
     fake_safe.n = 0
     monkeypatch.setattr(sm, "solve_safe_amount", fake_safe)
     captured = {}
-    def fake_search(uid, rdate, ramt, prof, evts, fx, recurrence_flags=None):
+    def fake_search(uid, rdate, ramt, prof, evts, fx, recurrence_flags=None, **_kwargs):
         captured["flags"] = recurrence_flags
         return ["stop:event_x"]
     monkeypatch.setattr(sm, "search_changes", fake_search)

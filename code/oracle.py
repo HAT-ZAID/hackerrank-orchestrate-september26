@@ -4,12 +4,22 @@ Launder logic:
 - safe_amount: max X <= requested_amount such that balance - X >= min_balance
   for all t in [0, 90].
 - earliest_date: first t in [0, 90] such that balance >= requested_amount.
+
+Contract (Task 3):
+- cash rows come from the supplied events only, plus the committed forecasts
+  produced by :mod:`code.forecast`;
+- an ambiguous row (unknown FX rate, unknown/blank status) **fails closed**:
+  ``safe_amount = 0``, ``earliest_date = None``, ``ledger = []``,
+  ``fail_closed = True`` with a reason.  A synthetic flat ledger is never
+  returned, because a flat ledger cannot be told apart from a real one and
+  must never be treated as a valid plan ledger downstream.
 """
 from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
+from code.forecast import build_forecast
 from code.fx import resolve_rate
 from code.recurrence import detect_recurrence  # noqa: F401 (kept for tooling compat)
 
@@ -124,38 +134,6 @@ def _dedup_events(events: list[dict]) -> list[dict]:
     return [e for i, e in enumerate(survivors) if i not in drop_ids]
 
 
-def _median_interval(intervals: list[int]) -> int:
-    s = sorted(intervals)
-    n = len(s)
-    mid = n // 2
-    if n % 2 == 1:
-        return s[mid]
-    # Even-n median uses integer floor division (//2): a .5 average is floored
-    # to a whole day (conservative timing kept; no behavior change here).
-    return (s[mid - 1] + s[mid]) // 2
-
-
-def _history_eligible(e: dict, for_expense: bool) -> bool:
-    if for_expense:
-        # Subscriptions are recurring spending: count them as expense history.
-        if str(e.get("event_type", "") or "").strip().lower() not in ("expense", "subscription"):
-            return False
-    else:
-        if str(e.get("event_type", "") or "").strip().lower() != "income":
-            return False
-    status = _norm_status(e)
-    d = _norm_dir(e)
-    if d == "non_cash":
-        return False
-    if status not in ("settled", "scheduled", "pending"):
-        return False
-    if status == "pending":
-        if for_expense:
-            return d == "debit"
-        return False
-    return True
-
-
 def solve_safe_amount(
     user_id: str,
     request_date_str: str,
@@ -165,6 +143,9 @@ def solve_safe_amount(
     fx_rows: list[dict],
     recurrence_flags: set[tuple[str, str, str]],
     suppressed_categories: set[str] | None = None,
+    *,
+    evidence_flags: set[str] | list[str] | None = None,
+    expense_facts: list[dict] | None = None,
 ) -> dict:
     req_date = date.fromisoformat(request_date_str)
 
@@ -213,57 +194,8 @@ def solve_safe_amount(
     # Dedup before the window loop: collapse event_id + linked_event_id retries.
     user_events = _dedup_events(user_events_raw)
 
-    # Identify recurring expense categories (protected AND flexible: a spending
-    # change only matters if the category is forecast at all) + income ones.
-    recurring_expense_cats = set()
-    recurring_income_cats: set[str] = set()
-    for e in user_events:
-        cat = e.get("category")
-        et = str(e.get("event_type", "") or "").strip().lower()
-        if et in ("expense", "subscription"):
-            key = (str(e.get("user_id", "") or ""), cat, str(e.get("event_type", "") or ""))
-            if key in recurrence_flags:
-                recurring_expense_cats.add(cat)
-        if et == "income":
-            key = (str(e.get("user_id", "") or ""), cat, str(e.get("event_type", "") or ""))
-            if key in recurrence_flags:
-                recurring_income_cats.add(cat)
-
-    # Build frequency map for recurring expense categories + recurring income
-    # Only countable history (same event_type, settled/scheduled +pending-debit for expenses).
-    recurring_expense_freq = {}
-    income_cat_freq: dict[str, list[date]] = {}
-    for e in user_events:
-        cat = e.get("category")
-        if cat in recurring_expense_cats or cat in recurring_income_cats:
-            is_exp = cat in recurring_expense_cats
-            # Require same event_type as the forecast kind.
-            if is_exp and not _history_eligible(e, for_expense=True):
-                # Allow income cats to still be checked below; skip expense-only.
-                if cat not in recurring_income_cats or not _history_eligible(e, for_expense=False):
-                    continue
-            if cat in recurring_income_cats and cat not in recurring_expense_cats:
-                if not _history_eligible(e, for_expense=False):
-                    continue
-            if cat in recurring_expense_cats and cat in recurring_income_cats:
-                # Dual-category: keep row for each kind it is eligible for.
-                exp_ok = _history_eligible(e, for_expense=True)
-                inc_ok = _history_eligible(e, for_expense=False)
-                if not exp_ok and not inc_ok:
-                    continue
-            s_date_str = e.get("settlement_date") or e.get("event_date")
-            if s_date_str and isinstance(s_date_str, str):
-                try:
-                    e_date = date.fromisoformat(s_date_str)
-                    if e_date < req_date:
-                        if cat in recurring_expense_cats and _history_eligible(e, for_expense=True):
-                            recurring_expense_freq.setdefault(cat, []).append(e_date)
-                        if cat in recurring_income_cats and _history_eligible(e, for_expense=False):
-                            income_cat_freq.setdefault(cat, []).append(e_date)
-                except ValueError:
-                    pass
-
     processed_events = []
+    fail_reasons: list[str] = []
     for e in user_events:
         status = _norm_status(e)
         dir_norm = _norm_dir(e)
@@ -279,7 +211,7 @@ def solve_safe_amount(
             # Unknown/blank statuses are ambiguous evidence. They must not be
             # silently treated as a non-cash row: fail closed below.
             if status not in _ALLOWED_STATUSES and status not in _KNOWN_IGNORED_STATUSES:
-                processed_events.append({"date": e_date, "delta": None, "flag": "STATUS_UNKNOWN"})
+                fail_reasons.append("STATUS_UNKNOWN")
                 continue
             if status in _KNOWN_IGNORED_STATUSES:
                 continue
@@ -291,8 +223,10 @@ def solve_safe_amount(
             fx_res = resolve_rate(fx_rows, e.get("currency"), home_ccy, s_date_str)
             rate = fx_res["rate"]
 
-            if rate is None:
-                processed_events.append({"date": e_date, "delta": None, "flag": "FX_UNKNOWN"})
+            # A prior-dated snapshot is resolved but still ambiguous: the FX
+            # contract flags it FX_UNKNOWN so the ledger fails closed.
+            if rate is None or fx_res.get("flag") == "FX_UNKNOWN":
+                fail_reasons.append("FX_UNKNOWN")
                 continue
 
             try:
@@ -304,7 +238,7 @@ def solve_safe_amount(
                     raise ValueError("non-finite amount")
                 amt = amt_val * rate
             except Exception:
-                processed_events.append({"date": e_date, "delta": None, "flag": "FX_UNKNOWN"})
+                fail_reasons.append("FX_UNKNOWN")
                 continue
 
             multiplier = -1 if dir_norm == "debit" else 1
@@ -315,120 +249,44 @@ def solve_safe_amount(
                 "category": e.get("category"),
             })
 
-    # Add forecasted recurring expenses and incomes for the 90‑day window.
-    # Median intervals (arrears-outlier robust); require >=2 pre-request dates;
-    # Decimal averages over settled/scheduled (+pending+debit for expenses), same event_type.
-    for cat in sorted(recurring_expense_cats):
-        dates = recurring_expense_freq.get(cat, [])
-        if len(dates) < 2:
-            continue
-        sorted_dates = sorted(dates)
-        intervals = [(sorted_dates[i+1] - sorted_dates[i]).days for i in range(len(sorted_dates)-1)]
-        if not intervals:
-            continue
-        avg_interval = _median_interval(intervals)
-        if avg_interval <= 0:
-            avg_interval = 30
-
-        cat_events = [e for e in user_events
-                      if e.get("category") == cat and _history_eligible(e, for_expense=True)]
-        if cat in suppressed:
-            # A spending change stops this category going forward. Historical
-            # amounts stay in the ledger; only future forecast occurrences vanish.
-            avg_amount = Decimal("0")
-        else:
-            cat_amounts: list[Decimal] = []
-            for ce in cat_events:
-                d = _amount_abs(ce)
-                if d is None:
-                    continue
-                # FX: history was averaged in raw units while in-window events are
-                # FX-converted; convert each history amount at its own settlement date.
-                # Choice: on missing rate skip that observation (don't invent a rate,
-                # don't pollute the average with raw foreign units).
-                s_hist = ce.get("settlement_date") or ce.get("event_date")
-                if not s_hist or not isinstance(s_hist, str):
-                    continue
-                fx_hist = resolve_rate(fx_rows, ce.get("currency"), home_ccy, s_hist)
-                if fx_hist["rate"] is None:
-                    continue
-                d_home = d * fx_hist["rate"]
-                # Recurring expenses forecast the full debit average: use -abs(d_home)
-                # so a refund/credit row cannot lower (optimistically shrink) the forecast.
-                cat_amounts.append(-d_home)
-            if not cat_amounts:
-                continue
-            avg_amount = sum(cat_amounts, Decimal("0")) / Decimal(len(cat_amounts))
-        # Determine first forecast date by rolling forward from last history date
-        last_date = max(dates)
-        next_date = last_date + timedelta(days=avg_interval)
-        while next_date < req_date:
-            next_date += timedelta(days=avg_interval)
-
-        while next_date <= window_end:
-            if not any(e.get("category") == cat and e["date"] == next_date for e in processed_events):
-                processed_events.append({
-                    "date": next_date,
-                    "delta": avg_amount,
-                    "flag": "ESSENTIAL_FORECAST",
-                    "category": cat,
-                })
-            next_date += timedelta(days=avg_interval)
-
-    # Forecast recurring income (e.g. salary) using same interval logic
-    for cat in sorted(recurring_income_cats):
-        dates = income_cat_freq.get(cat, [])
-        if len(dates) < 2:
-            continue
-        sorted_dates = sorted(dates)
-        intervals = [(sorted_dates[i+1] - sorted_dates[i]).days for i in range(len(sorted_dates)-1)]
-        if not intervals:
-            continue
-        avg_interval = _median_interval(intervals)
-        if avg_interval <= 0:
-            avg_interval = 30
-        cat_events = [e for e in user_events
-                      if e.get("category") == cat and _history_eligible(e, for_expense=False)]
-        cat_amounts_inc: list[Decimal] = []
-        for ce in cat_events:
-            d = _amount_abs(ce)
-            if d is None:
-                continue
-            # FX: convert each income history amount at its own settlement date;
-            # skip the observation when no rate exists (same choice as expenses).
-            # Income sign kept as-is (+abs): only the expense path forces -abs.
-            s_hist = ce.get("settlement_date") or ce.get("event_date")
-            if not s_hist or not isinstance(s_hist, str):
-                continue
-            fx_hist = resolve_rate(fx_rows, ce.get("currency"), home_ccy, s_hist)
-            if fx_hist["rate"] is None:
-                continue
-            cat_amounts_inc.append(d * fx_hist["rate"])
-        if not cat_amounts_inc:
-            continue
-        avg_amount = sum(cat_amounts_inc, Decimal("0")) / Decimal(len(cat_amounts_inc))
-        last_date = max(dates)
-        next_date = last_date + timedelta(days=avg_interval)
-        while next_date < req_date:
-            next_date += timedelta(days=avg_interval)
-        while next_date <= window_end:
-            if not any(e.get("category") == cat and e["date"] == next_date for e in processed_events):
-                processed_events.append({
-                    "date": next_date,
-                    "delta": avg_amount,
-                    "flag": "INCOME_FORECAST",
-                    "category": cat,
-                })
-            next_date += timedelta(days=avg_interval)
-
-    # 2. Compute daily balances (including forecasts) and derive safe amount from the minimum balance
-    # Fail-closed on FX ambiguity per spec: keep the 91-point ledger contract.
-    if any(e.get("flag") in {"FX_UNKNOWN", "STATUS_UNKNOWN"} for e in processed_events):
+    if fail_reasons:
+        # Explicit fail-closed contract: no safe amount, no date, and no ledger.
+        # A flat synthetic ledger would look like a real one downstream.
         return {
             "safe_amount": Decimal("0"),
             "earliest_date": None,
-            "ledger": [start_bal for _ in range(91)],
+            "ledger": [],
+            "fail_closed": True,
+            "fail_closed_reason": fail_reasons[0],
+            "processed_events": [],
+            "forecast": [],
+            "forecast_warnings": [],
         }
+
+    # Committed expense/salary projections come from the explicit policy module;
+    # the oracle never extrapolates on its own.
+    forecast = build_forecast(
+        user_events,
+        req_date,
+        user_id=user_id,
+        home_currency=home_ccy,
+        fx_rows=fx_rows,
+        recurrence_flags=recurrence_flags,
+        suppressed_categories=suppressed,
+        protected_categories=protected_cats,
+        evidence_flags=evidence_flags,
+        expense_facts=expense_facts,
+    )
+    for entry in forecast.entries:
+        processed_events.append({
+            "date": entry.date,
+            "delta": entry.amount,
+            "flag": "INCOME_FORECAST" if entry.kind == "income" else "ESSENTIAL_FORECAST",
+            "category": entry.category,
+            "source": entry.source,
+        })
+
+    # 2. Compute daily balances (including forecasts) and derive safe amount from the minimum balance
     daily_balances = []
     curr_bal = start_bal
     for i in range(91):
@@ -457,4 +315,18 @@ def solve_safe_amount(
         "safe_amount": safe_amount,
         "earliest_date": earliest_date,
         "ledger": daily_balances,
+        "fail_closed": False,
+        "fail_closed_reason": None,
+        "processed_events": processed_events,
+        "forecast": [
+            {
+                "date": entry.date.isoformat(),
+                "amount": str(entry.amount),
+                "kind": entry.kind,
+                "category": entry.category,
+                "source": entry.source,
+            }
+            for entry in forecast.entries
+        ],
+        "forecast_warnings": list(forecast.warnings),
     }

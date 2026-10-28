@@ -17,7 +17,10 @@ def test_fx_unknown_forces_zero_safe_amount():
     res = solve_safe_amount("u1", "2026-01-01", "5000", profile, events, fx, flags)
     assert res["safe_amount"] == Decimal("0")
     assert res["earliest_date"] is None # cannot prove safe payment if an event is unknown
-    assert len(res["ledger"]) == 91  # fail-closed keeps 91-point contract
+    # Task 3 contract: an ambiguous ledger is never synthesized; it is empty.
+    assert res["ledger"] == []
+    assert res["fail_closed"] is True
+    assert res["fail_closed_reason"] == "FX_UNKNOWN"
 
 
 def _fx_hist(date, amount, currency, eid, direction="debit", status="settled"):

@@ -45,6 +45,9 @@ def search_changes(
     events: list[dict],
     fx_rows: list[dict],
     recurrence_flags=None,
+    *,
+    evidence_flags=None,
+    expense_facts=None,
 ) -> list[str]:
     """Exhaustive search for the best set of spending changes.
 
@@ -136,6 +139,8 @@ def search_changes(
                 user_id, request_date, str(requested_amount),
                 profile, modified_events, fx_rows, flags_to_use,
                 suppressed_categories=suppressed,
+                evidence_flags=evidence_flags,
+                expense_facts=expense_facts,
             )
             if res["safe_amount"] >= requested_amount:
                 # Calculate total savings by eid lookup (order-independent).

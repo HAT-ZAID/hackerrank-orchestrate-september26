@@ -194,19 +194,25 @@ def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) ->
 
 
 def _evidence_notes(facts: dict) -> list[str]:
-    """Limitations recorded for the forecast layer (Task 3), never silent."""
+    """Limitations that still apply after the forecast layer (Task 3).
+
+    Income-end flags and expense facts are now consumed by :mod:`code.forecast`,
+    so their old "not applied" notes are gone; an ambiguous fact is reported as
+    a forecast warning instead of a silent note.
+    """
     notes: list[str] = []
-    if "employment_ended" in facts.get("flags", set()) or "contract_ended" in facts.get("flags", set()):
-        notes.append("income_end_not_applied_to_forecast")
-    if "partial_income_ended" in facts.get("flags", set()):
-        notes.append("partial_income_end_not_applied_to_forecast")
     if any(fact.get("status") == "confirmed" for fact in facts.get("income_facts", [])):
         notes.append("confirmed_income_not_injected")
     if any(change.get("amount") is None for change in facts.get("salary_changes", [])):
         notes.append("unquantified_salary_change_not_applied")
-    if facts.get("expense_facts"):
-        notes.append("expense_changes_not_applied_to_forecast")
     return notes
+
+
+def _forecast_evidence(evidence: dict) -> tuple[set[str], list[dict]]:
+    """Typed evidence handed to the oracle forecast; never raw message text."""
+    flags = {str(flag) for flag in (evidence.get("flags") or []) if str(flag).strip()}
+    facts = [fact for fact in (evidence.get("expense_facts") or []) if isinstance(fact, dict)]
+    return flags, facts
 
 
 def _parse_plan_legs(payment_plan: str) -> list[tuple[date, Decimal]] | None:
@@ -382,7 +388,35 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
     allows_partial = str(allows_partial_payment).strip().lower() == "true" if allows_partial_payment is not None else False
 
     # 2. Get Oracle results for the base state (modified copy carries salary injection).
-    res_now = solve_safe_amount(user_id, req_date, str(req_amt_dec), profile, events_for_oracle, fx_rows, recurrence_flags)
+    #    Typed evidence reaches the forecast layer here; the oracle signature is frozen.
+    evidence_flags, expense_facts = _forecast_evidence(evidence)
+    res_now = solve_safe_amount(
+        user_id, req_date, str(req_amt_dec), profile, events_for_oracle, fx_rows, recurrence_flags,
+        evidence_flags=evidence_flags, expense_facts=expense_facts,
+    )
+    if res_now.get("fail_closed"):
+        # An ambiguous ledger cannot certify any amount: fail closed explicitly
+        # instead of ranking options derived from a synthetic ledger.
+        reason = str(res_now.get("fail_closed_reason") or "UNKNOWN")
+        evidence["warnings"] = list(evidence.get("warnings", [])) + [{
+            "flag": "LEDGER_FAIL_CLOSED",
+            "detail": f"the ledger cannot be valued or classified with confidence ({reason})",
+        }]
+        return {
+            "request_id": rid,
+            "amount_safe_to_pay": "0",
+            "affordability_status": "not_affordable",
+            "recommended_payment_method": "not_recommended",
+            "payment_plan": "none",
+            "earliest_date_for_full_payment": None,
+            "spending_changes_needed": "none",
+            "decision_explanation": (
+                f"No payment is safe: the ledger had to fail closed ({reason}) because at "
+                "least one cash row cannot be valued or classified with confidence. "
+                "Resolve the ambiguous row before committing to this request."
+            ),
+            "evidence": evidence,
+        }
     safe_amt = res_now["safe_amount"]
     earliest = res_now["earliest_date"]
 
@@ -563,7 +597,10 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
             _all_miss = True
     if (not viable_options) or _all_miss:
         try:
-            changes = search_changes(user_id, req_date, req_amt_dec, profile, events_for_oracle, fx_rows, recurrence_flags)
+            changes = search_changes(
+                user_id, req_date, req_amt_dec, profile, events_for_oracle, fx_rows,
+                recurrence_flags, evidence_flags=evidence_flags, expense_facts=expense_facts,
+            )
             if changes:
                 spending_needed = "|".join(changes)
                 # Re-evaluate under the SAME semantics search_changes validated:
@@ -587,10 +624,18 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
                             cat = str(e.get("category", "") or "").strip().lower()
                             if cat:
                                 suppressed_cats.add(cat)
-                res2 = solve_safe_amount(user_id, req_date, str(req_amt_dec), profile, mod_events, fx_rows,
-                                         recurrence_flags, suppressed_categories=suppressed_cats)
-                _append_changed_options(res2["safe_amount"], res2["earliest_date"],
-                                        res2.get("ledger", []), spending_needed)
+                res2 = solve_safe_amount(
+                    user_id, req_date, str(req_amt_dec), profile, mod_events, fx_rows,
+                    recurrence_flags, suppressed_categories=suppressed_cats,
+                    evidence_flags=evidence_flags, expense_facts=expense_facts,
+                )
+                # A fail-closed re-run certifies nothing: adding its options
+                # would rank a plan the ledger cannot support.
+                if not res2.get("fail_closed"):
+                    _append_changed_options(res2["safe_amount"], res2["earliest_date"],
+                                            res2.get("ledger", []), spending_needed)
+                else:
+                    spending_needed = "none"
         except Exception:
             pass
         if not viable_options:

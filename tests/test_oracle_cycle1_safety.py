@@ -116,7 +116,7 @@ def test_opposite_direction_linked_rows_are_preserved():
     assert result["ledger"][1] == Decimal("4400")
 
 
-def test_unknown_and_blank_statuses_do_not_count_as_cash():
+def test_unknown_and_blank_statuses_fail_closed_without_a_ledger():
     events = [
         _event(event_id="unknown", status="unknown"),
         _event(event_id="blank", status=""),
@@ -126,14 +126,20 @@ def test_unknown_and_blank_statuses_do_not_count_as_cash():
 
     assert result["safe_amount"] == Decimal("0")
     assert result["earliest_date"] is None
-    assert result["ledger"] == [Decimal("5000")] * 91
+    # Task 3 contract: a flat synthetic ledger is indistinguishable from a real
+    # one, so an ambiguous status returns no ledger at all.
+    assert result["ledger"] == []
+    assert result["fail_closed"] is True
+    assert result["fail_closed_reason"] == "STATUS_UNKNOWN"
 
 
-def test_fx_fail_closed_keeps_91_point_ledger_shape():
+def test_fx_fail_closed_returns_no_ledger():
     events = [_event(currency="EUR")]
 
     result = solve_safe_amount("u1", "2026-01-01", "15000", _profile(), events, [], set())
 
     assert result["safe_amount"] == Decimal("0")
     assert result["earliest_date"] is None
-    assert result["ledger"] == [Decimal("5000")] * 91
+    assert result["ledger"] == []
+    assert result["fail_closed"] is True
+    assert result["fail_closed_reason"] == "FX_UNKNOWN"
