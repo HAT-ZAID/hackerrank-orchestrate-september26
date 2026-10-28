@@ -99,20 +99,48 @@ def _money_plan(plan: str, safe_amount: str, requested_amount: str, partial: boo
 
 
 def main():
+    output_df, _usage = run_pipeline()
+    print(f"Wrote {len(output_df)} rows to output.csv")
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def run_pipeline(
+    repo_root=None,
+    *,
+    requests_path=None,
+    output_path=None,
+    write_output=True,
+    write_usage=True,
+):
+    """Run the production pipeline and return ``(output_frame, usage)``.
+
+    Defaults preserve ``python -m code.main`` exactly: repo-root paths, the
+    production OCR/evidence resolution, strict installment safety, fail-closed
+    rows, usage-report writing and LF line endings. The evaluation harness
+    overrides only the request source and the write targets.
+    """
+    root = Path(repo_root).resolve() if repo_root is not None else REPO_ROOT
     ocr_path = configure_runtime()
-    REPO_ROOT = Path(__file__).resolve().parent.parent
+
     # Load data (repo-root anchored so any CWD works; no CLI change)
-    requests = pd.read_csv(REPO_ROOT / "dataset/requests.csv", dtype=str)
-    profiles = pd.read_csv(REPO_ROOT / "dataset/financial_profiles.csv", dtype=str)
-    events = pd.read_csv(REPO_ROOT / "dataset/financial_events.csv", dtype=str, keep_default_na=False).to_dict("records")
-    images = pd.read_csv(REPO_ROOT / "dataset/images.csv", dtype=str, keep_default_na=False)
-    fx = pd.read_csv(REPO_ROOT / "dataset/exchange_rates.csv", dtype=str).to_dict("records")
-    options = pd.read_csv(REPO_ROOT / "dataset/request_payment_options.csv", dtype=str)
-    messages = pd.read_csv(REPO_ROOT / "dataset/messages.csv", dtype=str)
+    if requests_path is None:
+        requests = pd.read_csv(root / "dataset/requests.csv", dtype=str)
+    else:
+        # Reference/sample request files carry blank expected fields; keep them
+        # as empty strings so the harness compares the text the pipeline saw.
+        requests = pd.read_csv(Path(requests_path), dtype=str, keep_default_na=False)
+    profiles = pd.read_csv(root / "dataset/financial_profiles.csv", dtype=str)
+    events = pd.read_csv(root / "dataset/financial_events.csv", dtype=str, keep_default_na=False).to_dict("records")
+    images = pd.read_csv(root / "dataset/images.csv", dtype=str, keep_default_na=False)
+    fx = pd.read_csv(root / "dataset/exchange_rates.csv", dtype=str).to_dict("records")
+    options = pd.read_csv(root / "dataset/request_payment_options.csv", dtype=str)
+    messages = pd.read_csv(root / "dataset/messages.csv", dtype=str)
     events, evidence_warnings = resolve_event_amounts(
         images,
         events,
-        REPO_ROOT / "dataset/media/images",
+        root / "dataset/media/images",
         ocr_available=ocr_path is not None,
     )
 
@@ -169,10 +197,15 @@ def main():
 
     # Create DataFrame and write to CSV (LF line endings per submission contract)
     output_df = pd.DataFrame(output_rows)
-    output_df.to_csv(REPO_ROOT / "output.csv", index=False, lineterminator="\n")
-    write_usage_report(REPO_ROOT / "evaluation" / "usage_report.md", usage, len(output_rows))
-    write_usage_report(REPO_ROOT / "tools" / "evaluation" / "usage_report.md", usage, len(output_rows))
-    print(f"Wrote {len(output_df)} rows to output.csv")
+    if write_output:
+        if output_path is None:
+            output_df.to_csv(root / "output.csv", index=False, lineterminator="\n")
+        else:
+            output_df.to_csv(Path(output_path), index=False, lineterminator="\n")
+    if write_usage:
+        write_usage_report(root / "evaluation" / "usage_report.md", usage, len(output_rows))
+        write_usage_report(root / "tools" / "evaluation" / "usage_report.md", usage, len(output_rows))
+    return output_df, usage
 
 if __name__ == "__main__":
     # `--help` must describe the entrypoint instead of silently running the

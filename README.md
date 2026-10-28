@@ -64,7 +64,9 @@ is in [`problem_statement.md`](./problem_statement.md) and AGENTS.md §6.2.
 | `code/evidence.py` | Resolves blank event amounts from linked images without inventing values; emits `AMOUNT_UNRESOLVED` / `OCR_UNAVAILABLE` / invalid-link warnings that can fail a request closed |
 | `code/explanations.py` | Produces `decision_explanation` prose: optional LLM call, schema-validated and grounding-checked against the already-computed decision, deterministic fallback otherwise |
 | `code/usage.py` | Token/cost accounting with the 50-call provider ceiling; writes the usage report |
-| `code/main.py` | CLI entry point: loads `dataset/`, runs all 250 requests, fails closed on unresolved evidence, writes `output.csv` and the usage report |
+| `code/main.py` | CLI entry point: loads `dataset/`, runs all 250 requests, fails closed on unresolved evidence, writes `output.csv` and the usage report; exposes `run_pipeline(...)` for the evaluator |
+| `evaluation/semantics.py` | Semantic comparison of the six machine fields: cent-tolerant amounts, exact vocabulary, parsed plans, normalized dates, canonical unordered spending changes |
+| `evaluation/run.py` | Single-command gate runner (G0–G7), real-pipeline PR/release modes, JSON + Markdown reports, provenance hashes |
 | `tools/tui.py` | Interactive TUI over the same solver: session-only edits in memory, never writes `output.csv` or `dataset/`, never calls the LLM provider |
 
 ### Why deterministic
@@ -107,6 +109,29 @@ code.main` still needs the repository root as the working directory so the
 `code` package resolves). Each run processes all 250 requests, writes
 `output.csv` in the repository root with LF line endings, and writes the usage
 report. `python -m code.main --help` prints usage without running the pipeline.
+
+### Evaluation harness
+
+```bash
+python -m evaluation.run --mode pr
+python -m evaluation.run --mode release --provider replay --archive code.zip
+```
+
+PR mode runs the real pipeline (no synthetic rows, no OCR bypass), regenerates
+`output.csv` and the usage reports, then grades the 25 public sample rows
+semantically against `dataset/sample_requests.csv`. It writes
+`evaluation/report.json` and `evaluation/report.md`, compares two clean sample
+runs byte-for-byte for determinism, and records commit/output/usage-report
+hashes. Gates G0–G4 are required; G1 (no status upgrades, no safe overclaims)
+and G2 (semantic sample quality) are release-blocking. G5–G7 stay
+`NOT_APPLICABLE` until their later-task artifacts exist, and an overall failure
+or incomplete gate exits non-zero rather than reporting a false pass.
+
+The semantic comparator is also available directly:
+
+```bash
+python -m tools.verify_samples   # exit 0 only when all 25 sample rows match
+```
 
 ### Interactive TUI
 

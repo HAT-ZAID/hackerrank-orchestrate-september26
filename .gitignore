@@ -10,4 +10,6 @@ code.zip
 .env
 .env.*
 !.env.example
+evaluation/report.json
+evaluation/report.md
 
