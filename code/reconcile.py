@@ -34,12 +34,10 @@ CONFLICT_ORDER = (
 )
 
 _CANCEL_CUE = re.compile(r"\bcancell?ed\b|dibatalkan|pembatalan", re.IGNORECASE)
-_NEGATED_CANCEL_CUE = re.compile(
-    r"\bnot (?:been )?cancell?ed\b|\bnever (?:been )?cancell?ed\b"
-    r"|\bhas ?n[o']t been cancell?ed\b|\bwas ?n[o']t cancell?ed\b"
-    r"|tidak (?:pernah )?dibatalkan|belum dibatalkan",
-    re.IGNORECASE,
+_NEGATION_TOKEN = re.compile(
+    r"\b(?:not|never|no|tidak|belum|bukan)\b|(?:n't|n\u2019t)\b", re.IGNORECASE
 )
+_NEGATION_WINDOW = 24
 _SETTLE_CUE = re.compile(
     r"has reached your account|proceeds have settled|has settled in the cash account"
     r"|payment was received|has been credited|already credited"
@@ -121,6 +119,21 @@ def _amount_str(value: float) -> str:
     return str(value)
 
 
+def _has_cancellation(text: str) -> bool:
+    """True when at least one cancellation mention in ``text`` is not negated.
+
+    Negation is scoped to the individual mention: "was not cancelled at first,
+    but it was cancelled today" is a cancellation, while "not cancelled and
+    still pending" is not.
+    """
+    for match in _CANCEL_CUE.finditer(text):
+        head = text[max(0, match.start() - _NEGATION_WINDOW) : match.start()]
+        if _NEGATION_TOKEN.search(head):
+            continue
+        return True
+    return False
+
+
 def amendment_from_message(message: dict) -> dict | None:
     """Classify one message into an amendment intent for its related event.
 
@@ -135,7 +148,7 @@ def amendment_from_message(message: dict) -> dict | None:
     amount, currency = _amount_from_text(text)
     date = _date_from_text(text)
 
-    if _CANCEL_CUE.search(text) and not _NEGATED_CANCEL_CUE.search(text):
+    if _has_cancellation(text):
         action, new_status = "cancelled", "cancelled"
     elif _SETTLE_CUE.search(text):
         action, new_status = "settled", "settled"

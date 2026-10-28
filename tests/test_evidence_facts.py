@@ -118,6 +118,48 @@ def test_end_settlement_dates_are_anchored_to_their_own_fact():
     assert by_kind == {"confirmation": "2026-02-10", "final": "2026-03-20"}, by_kind
 
 
+def test_two_facts_in_one_sentence_keep_their_own_dates():
+    # Both facts share one sentence: the date must stay inside each fact's own region.
+    facts = parse_messages(
+        "u1",
+        _messages([
+            _msg(
+                "m1",
+                "Your employment has ended. The remaining confirmed monthly salary is USD 800 "
+                "and is confirmed for 2026-02-10, while the final settlement of USD 500 is "
+                "scheduled for 2026-03-20. Payroll ref EMP-0102.",
+            )
+        ]),
+    )
+    by_kind = {
+        c["kind"]: c["settlement_date"]
+        for c in facts["salary_changes"]
+        if c["kind"] in {"confirmation", "final"}
+    }
+    assert by_kind == {"confirmation": "2026-02-10", "final": "2026-03-20"}, by_kind
+
+
+def test_undated_fact_does_not_borrow_the_other_fact_date():
+    # The final settlement has no date of its own: it must stay None.
+    facts = parse_messages(
+        "u1",
+        _messages([
+            _msg(
+                "m1",
+                "Your employment has ended. The remaining confirmed monthly salary is USD 800 "
+                "and is confirmed for 2026-02-10. The final settlement of USD 500 will be sent "
+                "separately. Payroll ref EMP-0103.",
+            )
+        ]),
+    )
+    by_kind = {
+        c["kind"]: c["settlement_date"]
+        for c in facts["salary_changes"]
+        if c["kind"] in {"confirmation", "final"}
+    }
+    assert by_kind == {"confirmation": "2026-02-10", "final": None}, by_kind
+
+
 def test_employment_and_contract_end_are_stop_signals_not_income():
     df = _messages([
         _msg(
@@ -327,6 +369,43 @@ def test_negated_cancellation_does_not_cancel_the_event():
 
     amended, _ = reconcile_events([pending], [intent])
     assert amended[0]["status"] == "pending", "a negated cancellation must not cancel"
+
+
+def test_cancellation_negation_is_scoped_per_match():
+    from code.reconcile import amendment_from_message
+
+    # A negated occurrence must not mask a later, real cancellation in the same text.
+    mixed = amendment_from_message(
+        _msg(
+            "m1",
+            "The invoice was not cancelled at first, but it was cancelled today.",
+            related="e1",
+            sent_at="2025-01-02T00:00:00Z",
+        )
+    )
+    assert mixed["action"] == "cancelled", f"got {mixed}"
+
+    # Only-negated cancellation still falls through to the pending wording.
+    negated = amendment_from_message(
+        _msg(
+            "m2",
+            "This invoice was not cancelled and is still pending.",
+            related="e1",
+            sent_at="2025-01-03T00:00:00Z",
+        )
+    )
+    assert negated["action"] == "pending", f"got {negated}"
+
+    # A word merely ending in "nt" is not a negation token.
+    plain = amendment_from_message(
+        _msg(
+            "m3",
+            "The payment event was cancelled.",
+            related="e1",
+            sent_at="2025-01-04T00:00:00Z",
+        )
+    )
+    assert plain["action"] == "cancelled", f"got {plain}"
 
 
 def test_reconcile_warns_instead_of_misapplying():

@@ -361,26 +361,40 @@ def _date_after(text: str, cue: re.Pattern[str]) -> str | None:
     return date_match.group(1) if date_match else None
 
 
-def _sentence_at(text: str, position: int) -> str:
-    """The sentence of ``text`` that contains ``position``."""
-    start = 0
-    for stop in _SENTENCE_END.finditer(text):
-        if stop.start() >= position:
-            return text[start : stop.start()]
-        start = stop.end()
-    return text[start:]
+# Cues that introduce a distinct salary fact inside one message. A fact's own
+# region stops where the next fact starts, so a date can never bleed across.
+_FACT_SPLIT_CUES = (_REMAINING_SALARY, _FINAL_PAYMENT)
 
 
-def _date_in_sentence(text: str, cue: re.Pattern[str]) -> str | None:
-    """First ISO date in the same sentence as ``cue``.
+def _fact_date(text: str, cue: re.Pattern[str]) -> str | None:
+    """Date that belongs to the single fact introduced by ``cue``.
 
-    Anchoring on the cue's own sentence keeps two dated facts in one message from
-    inheriting the first date that appears anywhere in the text.
+    The fact region runs from the cue to the next competing fact cue or sentence
+    end, whichever comes first, and the date must be introduced by a date cue
+    inside that region. A fact without its own dated cue keeps ``None``; it never
+    borrows a neighbouring fact's date.
     """
     match = cue.search(text)
     if not match:
         return None
-    date_match = _ISO_DATE.search(_sentence_at(text, match.start()))
+    end = len(text)
+    sentence_end = _SENTENCE_END.search(text, match.end())
+    if sentence_end:
+        end = sentence_end.start()
+    for other_cue in _FACT_SPLIT_CUES:
+        other = other_cue.search(text, match.end())
+        if other:
+            end = min(end, other.start())
+    region = text[match.end() : end]
+    cue_matches = [
+        found
+        for found in (_CREDIT_CUE.search(region), _EFFECTIVE_CUE.search(region))
+        if found
+    ]
+    if not cue_matches:
+        return None
+    first = min(cue_matches, key=lambda found: found.start())
+    date_match = _ISO_DATE.search(region[first.end() :])
     return date_match.group(1) if date_match else None
 
 
@@ -466,8 +480,7 @@ def _extract_salary_changes(text: str, message_id: str) -> list[SalaryChange]:
                     amount=remaining_amount,
                     currency=remaining_currency or "",
                     effective_date=None,
-                    settlement_date=_date_in_sentence(text, _REMAINING_SALARY)
-                    or _date_in_sentence(text, _CREDIT_CUE),
+                    settlement_date=_fact_date(text, _REMAINING_SALARY),
                     confirmed=True,
                     source_message_id=message_id,
                     scope="remaining",
@@ -481,8 +494,7 @@ def _extract_salary_changes(text: str, message_id: str) -> list[SalaryChange]:
                     amount=final_amount,
                     currency=final_currency or "",
                     effective_date=None,
-                    settlement_date=_date_in_sentence(text, _FINAL_PAYMENT)
-                    or _date_in_sentence(text, _CREDIT_CUE),
+                    settlement_date=_fact_date(text, _FINAL_PAYMENT),
                     confirmed=True,
                     source_message_id=message_id,
                     scope="final",
