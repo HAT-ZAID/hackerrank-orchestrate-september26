@@ -19,6 +19,7 @@ Safety rules baked into this module:
 """
 from __future__ import annotations
 
+import argparse
 import io
 import sys
 from datetime import date, timedelta
@@ -30,6 +31,8 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+from tools.trace_view import DEFAULT_TRACE_DIR, TraceError, find_trace, load_trace, summarise
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -75,6 +78,7 @@ Commands:
   show <id>             decision panel + ledger + floor breaches + options
   dashboard             output.csv snapshot: counts, methods, needs attention
   new                   ask a new question for an existing user (session only)
+  trace <id>            summarize that request's agent trace (read-only)
   whatif <id> k=v ...   set overrides, re-solve, print the before/after diff
   changes <id>          candidate actions with each one's projected effect
   apply <id> <action>   try one candidate in-session, re-solve, show delta
@@ -89,6 +93,8 @@ whatif fields:  amount=<N>  date=<YYYY-MM-DD>  floor=<N>
 actions:        stop:<event_id>  or  reduce_to:<event_id>:<new_amount>
 `dashboard` reads the existing output.csv snapshot and never re-solves the
 batch; `new` adds an in-memory manual_0001-style request and solves only that.
+`trace` reads an agent trace file (never a live call) from --trace-dir
+(default traces/latest) and never launches a browser.
 Edits are session-only: output.csv and dataset/ are never written."""
 
 
@@ -617,11 +623,19 @@ def _signature(session: Session, request_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 class TUI:
-    def __init__(self, data=None, input_fn=input, console=None) -> None:
+    def __init__(self, data=None, input_fn=input, console=None, trace_dir=None) -> None:
         self.data = data
         self.session = Session()
         self.input_fn = input_fn
         self.console = console if console is not None else Console(markup=False, highlight=False)
+        # Read-only trace directory for `trace <id>`; nothing here writes to it.
+        # Relative paths resolve against the repo root, like the dataset.
+        if trace_dir is None:
+            self.trace_dir = REPO_ROOT / "traces" / "latest"
+        else:
+            self.trace_dir = Path(trace_dir)
+            if not self.trace_dir.is_absolute():
+                self.trace_dir = REPO_ROOT / self.trace_dir
         # Decisions are cached per request keyed by that request's own overlay
         # signature, so edits to one request never invalidate another.
         self._cache: dict[str, tuple[str, dict]] = {}
@@ -1004,6 +1018,72 @@ class TUI:
             return
         self.console.print(render_decision(decision), soft_wrap=True)
 
+    def cmd_trace(self, args) -> None:
+        """Read-only summary of one agent trace file (never a live call)."""
+        request_id = self._one_id(args, "trace")
+        if request_id is None:
+            return
+        path = find_trace(self.trace_dir, request_id)
+        if path is None:
+            self.console.print(
+                f"no trace for {request_id} under {self.trace_dir}; run the agent with "
+                "--trace-dir DIR, or point the TUI at it with "
+                "`python -m tools.tui --trace-dir DIR`",
+                style="yellow",
+            )
+            return
+        try:
+            trace = load_trace(path)
+        except TraceError as exc:
+            self.console.print(f"trace unreadable: {exc}", style="red")
+            return
+        summary = summarise(trace)
+        status = summary["status"]
+        if summary["candidate"] is None:
+            candidate = "none proposed (the deterministic row stands)"
+        else:
+            candidate = (
+                f"{'valid' if summary['candidate_valid'] else 'invalid'}, "
+                f"agreement {'yes' if summary['agreement'] else 'no'}, "
+                f"rationale from {summary['rationale_source']}"
+            )
+        table = Table(
+            title=f"trace {request_id}", show_header=False, box=None, pad_edge=False
+        )
+        table.add_column("field", style="bold")
+        table.add_column("value")
+        table.add_row("run id", summary["run_id"] or "unknown")
+        table.add_row("provider / model", f"{summary['provider']} / {summary['model']}")
+        table.add_row("model calls", str(summary["model_calls"]))
+        table.add_row(
+            "tokens", "not recorded" if summary["tokens"] is None else str(summary["tokens"])
+        )
+        table.add_row(
+            "final status",
+            status or "not written",
+            style=STATUS_STYLES.get(status),
+        )
+        table.add_row("method", summary["method"] or "not written")
+        table.add_row("candidate", candidate)
+        table.add_row("fallback", summary["fallback_reason"] or "none")
+        table.add_row("tool calls", ", ".join(summary["tool_names"]) or "none")
+        self.console.print(table)
+        self.console.print(f"trace file: {path}", soft_wrap=True)
+        if summary["differences"]:
+            diff = Table(title="candidate vs final")
+            diff.add_column("field")
+            diff.add_column("candidate")
+            diff.add_column("final")
+            for item in summary["differences"]:
+                diff.add_row(
+                    _clip(item.get("field"), 28),
+                    _clip(item.get("candidate"), 40) or "(empty)",
+                    _clip(item.get("final"), 40) or "(empty)",
+                )
+            self.console.print(diff)
+        elif summary["candidate"] is not None:
+            self.console.print("candidate matches the final row on every machine field")
+
     def cmd_show(self, args) -> None:
         request_id = self._one_id(args, "show")
         if not request_id:
@@ -1367,10 +1447,10 @@ def _reconfigure_stdout() -> None:
             pass
 
 
-def run_tui(data=None, input_fn=input) -> None:
+def run_tui(data=None, input_fn=input, trace_dir=None) -> None:
     """The REPL. Returns None; writes nothing to disk."""
     _reconfigure_stdout()
-    app = TUI(data=data, input_fn=input_fn)
+    app = TUI(data=data, input_fn=input_fn, trace_dir=trace_dir)
     console = app.console
     console.print("Buy or Wait? interactive TUI", style="bold")
     console.print(
@@ -1382,6 +1462,7 @@ def run_tui(data=None, input_fn=input) -> None:
         "show": app.cmd_show,
         "dashboard": app.cmd_dashboard,
         "new": app.cmd_new,
+        "trace": app.cmd_trace,
         "whatif": app.cmd_whatif,
         "changes": app.cmd_changes,
         "apply": app.cmd_apply,
@@ -1414,5 +1495,29 @@ def run_tui(data=None, input_fn=input) -> None:
     console.print("bye -- session discarded; output.csv and dataset/ untouched.")
 
 
+def main(argv=None) -> int:
+    """CLI entry point: ``--help`` works without starting the REPL."""
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.tui",
+        description=(
+            "Buy or Wait? interactive TUI. Session-only: it never writes "
+            "output.csv, dataset/ or any trace."
+        ),
+    )
+    parser.add_argument(
+        "--trace-dir",
+        metavar="DIR",
+        default=DEFAULT_TRACE_DIR,
+        help=(
+            "directory the read-only `trace <request_id>` command searches "
+            f"(default: {DEFAULT_TRACE_DIR}; relative paths resolve against the "
+            "repo root)"
+        ),
+    )
+    args = parser.parse_args(argv)
+    run_tui(trace_dir=args.trace_dir)
+    return 0
+
+
 if __name__ == "__main__":
-    run_tui()
+    raise SystemExit(main())
