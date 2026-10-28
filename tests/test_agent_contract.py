@@ -320,3 +320,158 @@ def test_tool_errors_are_structured_and_never_raise():
     bad_arguments = toolbox.call("get_financial_events")
     assert bad_arguments["ok"] is False
     assert bad_arguments["fatal"] is False
+
+
+class _ExplodingTrace:
+    """Trace recorder whose write step always fails (disk full / NaN)."""
+
+    enabled = True
+
+    def begin(self, request_id):
+        return None
+
+    def record(self, kind, payload=None):
+        return None
+
+    def finish(self, **kwargs):
+        raise OSError("disk full while writing trace")
+
+
+def _write_tiny_dataset(root: Path, request_id: str = "request_demo") -> None:
+    dataset = root / "dataset"
+    dataset.mkdir(parents=True, exist_ok=True)
+    (dataset / "requests.csv").write_text(
+        "request_id,user_id,request_date,request_type,requested_amount,"
+        "desired_completion_date,allows_partial_payment,request_text\n"
+        f"{request_id},user_demo,2026-01-05,purchase,1000,2026-01-31,false,"
+        "Is 1000 safe today?\n",
+        encoding="utf-8",
+    )
+    (dataset / "financial_profiles.csv").write_text(
+        "user_id,home_currency,current_available_balance,minimum_balance_to_keep,"
+        "financial_priorities,expense_categories_to_protect,"
+        "expense_categories_user_is_willing_to_reduce,"
+        "expense_categories_user_is_willing_to_stop,"
+        "payment_methods_user_will_consider,max_installment_months\n"
+        "user_demo,USD,5000,2000,,,,,full_payment,\n",
+        encoding="utf-8",
+    )
+    (dataset / "financial_events.csv").write_text(
+        "event_id,user_id,event_type,description,category,direction,amount,currency,"
+        "event_date,settlement_date,status,linked_event_id,flexibility,"
+        "minimum_allowed_amount\n",
+        encoding="utf-8",
+    )
+    (dataset / "exchange_rates.csv").write_text(
+        "rate_date,from_currency,to_currency,rate\n", encoding="utf-8"
+    )
+    (dataset / "request_payment_options.csv").write_text(
+        "payment_option_id,request_id,payment_method,payment_amount,"
+        "number_of_payments,first_payment_date,payment_frequency_days,financing_fee,"
+        "total_payable_amount\n"
+        f"payment_option_01,{request_id},full_payment,1000,1,2026-01-05,,0,1000\n",
+        encoding="utf-8",
+    )
+    (dataset / "messages.csv").write_text(
+        "message_id,user_id,request_id,related_event_id,sent_at,source_type,message_text\n",
+        encoding="utf-8",
+    )
+    (dataset / "images.csv").write_text(
+        "image_id,user_id,request_id,related_event_id\n", encoding="utf-8"
+    )
+
+
+def test_agent_failure_preserves_kernel_row_and_still_writes_output(
+    tmp_path, monkeypatch
+):
+    import code.agent as agent_mod
+    from code.main import run_pipeline
+
+    _write_tiny_dataset(tmp_path)
+    plain, _ = run_pipeline(repo_root=tmp_path, write_output=False, write_usage=False)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("verifier exploded")
+
+    monkeypatch.setattr(agent_mod, "enforce_decision", boom)
+    output = tmp_path / "agent_out.csv"
+    agent_run, _ = run_pipeline(
+        repo_root=tmp_path,
+        output_path=output,
+        write_output=True,
+        write_usage=False,
+        agent_request_ids=["request_demo"],
+    )
+
+    assert output.is_file()
+    written = pd.read_csv(output, dtype=str, keep_default_na=False)
+    assert len(written) == 1
+    assert agent_run.equals(plain)
+    for column in (
+        "request_id",
+        "amount_safe_to_pay",
+        "affordability_status",
+        "recommended_payment_method",
+        "payment_plan",
+        "earliest_date_for_full_payment",
+        "spending_changes_needed",
+        "decision_explanation",
+    ):
+        assert written.loc[0, column] == plain.loc[0, column]
+
+
+def test_trace_write_failure_keeps_final_row():
+    outcome = run_agent_once(
+        {"request_id": "request_demo"},
+        provider=None,
+        tools=None,
+        trace=_ExplodingTrace(),
+        kernel_result=dict(KERNEL),
+    )
+
+    assert outcome["trace_path"] is None
+    assert "trace_error" in outcome
+    assert "disk full" in outcome["trace_error"]
+    assert outcome["row"]["amount_safe_to_pay"] == "1000"
+    assert outcome["row"]["affordability_status"] == "affordable_now"
+
+
+def test_trace_redacts_secret_names_but_keeps_token_counters(tmp_path):
+    recorder = TraceRecorder("run-redaction", tmp_path)
+    recorder.begin("request_demo")
+    path = recorder.finish(
+        request_id="request_demo",
+        provider="null",
+        model="none",
+        usage={
+            "total_tokens": 5,
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "api_key": "sk-live-should-not-leak",
+            "access_token": "token-should-not-leak",
+            "Authorization": "Bearer should-not-leak",
+        },
+    )
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    usage = payload["usage"]
+
+    assert usage["total_tokens"] == 5
+    assert usage["input_tokens"] == 7
+    assert usage["output_tokens"] == 3
+    assert usage["api_key"] == REDACTED
+    assert usage["access_token"] == REDACTED
+    assert usage["Authorization"] == REDACTED
+    text = Path(path).read_text(encoding="utf-8")
+    assert "should-not-leak" not in text
+
+
+def test_context_mismatch_forces_kernel_rationale():
+    result = enforce_decision(
+        _candidate(), dict(KERNEL), request_context={"request_id": "request_other"}
+    )
+
+    verification = result["verification"]
+    assert verification["agent_agreement"] is True
+    assert verification["rationale_source"] == "kernel"
+    assert result["final_row"]["decision_explanation"] == KERNEL["decision_explanation"]
+    assert "request_other" in verification["fallback_reason"]

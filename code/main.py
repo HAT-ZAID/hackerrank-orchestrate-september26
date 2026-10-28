@@ -218,23 +218,30 @@ def run_pipeline(
 
         # Optional agent pass on top of the kernel row. The verifier always
         # returns kernel values, so the row is identical to the plain path
-        # unless a valid, agreeing candidate supplied its own rationale.
+        # unless a valid, agreeing candidate supplied its own rationale. Any
+        # substrate failure (verifier or trace writer) must leave the kernel row
+        # and the output write intact.
         agent_outcome = None
         if agent_state is not None and req["request_id"] in agent_state["ids"]:
             agent_state["kernel_results"][req["request_id"]] = res
-            agent_outcome = agent_state["run"](
-                {
-                    "request_id": req["request_id"],
-                    "user_id": user_id,
-                    "request": req.to_dict(),
-                    "profile": profile,
-                },
-                provider=provider,
-                tools=agent_state["toolbox"],
-                trace=agent_state["recorder"],
-                kernel_result=res,
-            )
-            res = agent_outcome["row"]
+            try:
+                outcome = agent_state["run"](
+                    {
+                        "request_id": req["request_id"],
+                        "user_id": user_id,
+                        "request": req.to_dict(),
+                        "profile": profile,
+                    },
+                    provider=provider,
+                    tools=agent_state["toolbox"],
+                    trace=agent_state["recorder"],
+                    kernel_result=res,
+                )
+            except Exception:
+                outcome = None
+            if outcome is not None:
+                agent_outcome = outcome
+                res = outcome["row"]
 
         # Format as output row
         safe_amount = _money(res["amount_safe_to_pay"])

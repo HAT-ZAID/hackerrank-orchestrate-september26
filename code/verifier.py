@@ -198,7 +198,11 @@ def enforce_decision(
 
     agreement = bool(candidate_valid and not differences)
     rationale = str(getattr(parsed, "rationale", "") or "").strip()
-    rationale_source = "candidate" if (agreement and rationale) else "kernel"
+    # A context mismatch means the row we are about to emit was not the request
+    # the candidate reasoned about, so its prose cannot be attached to it.
+    rationale_source = (
+        "candidate" if (agreement and rationale and not context_mismatch) else "kernel"
+    )
 
     final_row = dict(row)
     if rationale_source == "candidate":

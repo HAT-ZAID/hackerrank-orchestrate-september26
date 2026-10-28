@@ -11,8 +11,11 @@ Determinism split:
 * wall-clock timestamps and durations live only in the ``metadata`` block (and
   per-call ``duration_ms``), because they can never be compared across runs.
 
-Secrets are redacted before anything is written: any mapping key matching
-``key|token|secret|password|authorization`` has its value replaced.
+Secrets are redacted before anything is written: a mapping key whose *name
+segment* is ``key``/``api_key``/``token``/``secret``/``password``/
+``authorization`` (optionally underscore-delimited, case-insensitive) has its
+value replaced.  Segment matching keeps counters such as ``total_tokens`` and
+``input_tokens`` intact while still hiding ``api_key`` and ``access_token``.
 """
 from __future__ import annotations
 
@@ -25,7 +28,10 @@ from code.schema import TraceEvent, stable_json
 
 TRACE_SCHEMA_VERSION = 1
 REDACTED = "[REDACTED]"
-_SECRET_KEY = re.compile(r"key|token|secret|password|authorization", re.IGNORECASE)
+_SECRET_KEY = re.compile(
+    r"(?:^|_)(?:api_?key|key|token|secret|password|authorization)(?:$|_)",
+    re.IGNORECASE,
+)
 _UNSTABLE_KEYS = frozenset({"duration_ms"})
 _UNSTABLE_BLOCKS = frozenset({"metadata"})
 _UNSAFE_FILE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")

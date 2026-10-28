@@ -119,25 +119,33 @@ def run_agent_once(
 
     usage = _usage_for(active)
     trace_path = None
+    trace_error = None
     if enabled:
-        trace_path = trace.finish(
-            request_id=request_id,
-            provider=str(getattr(active, "name", "none")),
-            model=str(getattr(active, "model", "none")),
-            prompt_version=PROMPT_VERSION,
-            prompt_hash=prompt_hash(),
-            candidate=candidate_payload,
-            verification=verification,
-            final_row=final_row,
-            usage=usage,
-            fallback_reason=verification.get("fallback_reason"),
-        )
+        # Observability is best-effort: a failing trace write (NaN payload,
+        # disk full, permissions) must never fail or change the request.
+        try:
+            trace_path = trace.finish(
+                request_id=request_id,
+                provider=str(getattr(active, "name", "none")),
+                model=str(getattr(active, "model", "none")),
+                prompt_version=PROMPT_VERSION,
+                prompt_hash=prompt_hash(),
+                candidate=candidate_payload,
+                verification=verification,
+                final_row=final_row,
+                usage=usage,
+                fallback_reason=verification.get("fallback_reason"),
+            )
+        except Exception as exc:
+            trace_path = None
+            trace_error = f"{type(exc).__name__}: {exc}"
 
     return {
         "request_id": request_id,
         "row": final_row,
         "verification": verification,
         "trace_path": trace_path,
+        "trace_error": trace_error,
         "provider": str(getattr(active, "name", "none")),
         "model": str(getattr(active, "model", "none")),
         "candidate": candidate_payload,
