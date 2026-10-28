@@ -17,6 +17,172 @@ from code.options import get_valid_options
 from code.changes import search_changes
 from code.recurrence import detect_recurrence
 from code.parser import parse_messages
+from code.reconcile import reconcile_events
+
+# Salary kinds that may create a confirmed future income row when no matching
+# row exists (the historical raise behavior). A resumed/regular salary and any
+# reduction or temporary adjustment only amend an existing row: injecting them
+# would duplicate income that the payroll cadence already provides.
+_SALARY_INJECTABLE_KINDS = frozenset({"raise", "first", "final"})
+
+
+def _empty_evidence() -> dict:
+    return {
+        "flags": [],
+        "salary_changes": [],
+        "income_facts": [],
+        "expense_facts": [],
+        "event_updates": [],
+        "applied_salary_changes": [],
+        "event_amendment_notes": [],
+        "warnings": [],
+        "notes": [],
+    }
+
+
+def _salary_row_date(event: dict) -> str:
+    return str(event.get("settlement_date") or event.get("event_date") or "").strip()
+
+
+def _is_salary_row(event: dict, user_id) -> bool:
+    if str(event.get("user_id") or "") not in ("", str(user_id)):
+        return False
+    if str(event.get("category") or "").strip().lower() != "salary":
+        return False
+    return str(event.get("event_type") or "").strip().lower() == "income"
+
+
+def _amend_salary_row(events, user_id, target_date, amount, currency) -> bool:
+    matches = [
+        event
+        for event in events
+        if _is_salary_row(event, user_id) and _salary_row_date(event) == target_date
+    ]
+    if not matches:
+        return False
+    # Prefer a countable future row over an already-settled historical one,
+    # then order deterministically so a repeated run selects the same row.
+    matches.sort(
+        key=lambda event: (
+            0 if str(event.get("status") or "").strip().lower() in {"scheduled", "pending"} else 1,
+            str(event.get("event_id") or ""),
+        )
+    )
+    event = matches[0]
+    event["amount"] = str(amount)
+    if str(currency or "").strip():
+        event["currency"] = str(currency)
+    # Countable scheduled income; never resurrect a failed/cancelled row.
+    if str(event.get("status") or "").strip().lower() in ("", "nan", "none"):
+        event["status"] = "scheduled"
+    return True
+
+
+def _inject_salary_row(events, user_id, kind, target_date, amount, currency) -> None:
+    events.append({
+        "event_id": f"salary_{kind}_{target_date}",
+        "user_id": user_id,
+        "event_type": "income",
+        "description": "Salary update via payroll message (injected)",
+        "category": "salary",
+        "direction": "credit",
+        "amount": str(amount),
+        "currency": str(currency or ""),
+        "event_date": target_date,
+        "settlement_date": target_date,
+        "status": "scheduled",
+        "linked_event_id": "",
+        "flexibility": "fixed",
+        "minimum_allowed_amount": "",
+    })
+
+
+def _next_scheduled_salary_row(events, user_id, not_before: str):
+    candidates = [
+        event
+        for event in events
+        if _is_salary_row(event, user_id)
+        and str(event.get("status") or "").strip().lower() in {"scheduled", "pending"}
+        and _salary_row_date(event) >= not_before
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=_salary_row_date)[0]
+
+
+def _apply_salary_changes(events, salary_changes, user_id, profile, req_date) -> list[dict]:
+    """Apply typed salary facts to the oracle copy; return what was applied.
+
+    A dated change amends the salary row on that date, or injects a confirmed
+    income row for kinds that legitimately create income. An undated "next
+    payroll" change only amends the next scheduled salary row: it never invents
+    a payment date.
+    """
+    applied: list[dict] = []
+    request_day = str(req_date or "").strip()
+    try:
+        window_end = date.fromisoformat(request_day) + timedelta(days=90)
+    except Exception:
+        window_end = None
+
+    for change in salary_changes or []:
+        kind = str(change.get("kind") or "")
+        amount = change.get("amount")
+        if amount is None or kind == "ended":
+            continue
+        currency = change.get("currency") or profile.get("home_currency", "USD")
+        target = change.get("effective_date") or change.get("settlement_date")
+
+        if target:
+            try:
+                target_date = date.fromisoformat(str(target).strip())
+            except Exception:
+                continue
+            if window_end is not None and target_date > window_end:
+                continue
+            target_s = target_date.isoformat()
+            if _amend_salary_row(events, user_id, target_s, amount, currency):
+                applied.append({"kind": kind, "date": target_s, "amount": str(amount),
+                                "source_message_id": change.get("source_message_id", ""),
+                                "mode": "amended"})
+            elif kind in _SALARY_INJECTABLE_KINDS:
+                _inject_salary_row(events, user_id, kind, target_s, amount, currency)
+                applied.append({"kind": kind, "date": target_s, "amount": str(amount),
+                                "source_message_id": change.get("source_message_id", ""),
+                                "mode": "injected"})
+            continue
+
+        # Undated reduction/temporary/confirmation: amend the next payroll row
+        # only. No row means no application (never invent a salary payment).
+        if not request_day:
+            continue
+        row = _next_scheduled_salary_row(events, user_id, request_day)
+        if row is None:
+            continue
+        row_date = _salary_row_date(row)
+        row["amount"] = str(amount)
+        if str(currency or "").strip():
+            row["currency"] = str(currency)
+        applied.append({"kind": kind, "date": row_date, "amount": str(amount),
+                        "source_message_id": change.get("source_message_id", ""),
+                        "mode": "amended"})
+    return applied
+
+
+def _evidence_notes(facts: dict) -> list[str]:
+    """Limitations recorded for the forecast layer (Task 3), never silent."""
+    notes: list[str] = []
+    if "employment_ended" in facts.get("flags", set()) or "contract_ended" in facts.get("flags", set()):
+        notes.append("income_end_not_applied_to_forecast")
+    if "partial_income_ended" in facts.get("flags", set()):
+        notes.append("partial_income_end_not_applied_to_forecast")
+    if any(fact.get("status") == "confirmed" for fact in facts.get("income_facts", [])):
+        notes.append("confirmed_income_not_injected")
+    if any(change.get("amount") is None for change in facts.get("salary_changes", [])):
+        notes.append("unquantified_salary_change_not_applied")
+    if facts.get("expense_facts"):
+        notes.append("expense_changes_not_applied_to_forecast")
+    return notes
 
 
 def _parse_plan_legs(payment_plan: str) -> list[tuple[date, Decimal]] | None:
@@ -136,87 +302,47 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
     except Exception:
         events_for_oracle = [dict(e) for e in (events or [])]
 
-    # 1. Process Evidence (Messages) via EVENT INJECTION (oracle signature frozen).
+    # 1. Process Evidence (Messages) into typed facts, then apply them to the
+    #    oracle copy (oracle signature frozen). Untrusted content never decides
+    #    a field: only typed facts reach the ledger.
+    evidence = _empty_evidence()
     if messages_df is not None:
         try:
-            updates = parse_messages(user_id, messages_df)
+            facts = parse_messages(user_id, messages_df)
         except Exception:
-            updates = {"salary_updates": [], "event_updates": []}
-        # Apply event amendments to the copied list only.
-        for update in updates.get("event_updates", []):
-            for e in events_for_oracle:
-                if e.get("event_id") == update.get("related_event_id"):
-                    if "new_amount" in update:
-                        e["amount"] = str(update["new_amount"])
-                    if "new_date" in update:
-                        e["settlement_date"] = update["new_date"]
-                        e["event_date"] = update["new_date"]
+            facts = None
+        if facts is not None:
+            # Event amendments: exact event_id match only, AGENTS 6.3 conflict order.
+            events_for_oracle, amendment_warnings = reconcile_events(
+                events_for_oracle, facts.get("event_updates", [])
+            )
+            # Flag stability: snapshot BEFORE salary injection so a huge raise
+            # cannot drop the salary flag via CV (injection kept for amounts).
+            try:
+                _pre_injection = _copy.deepcopy(events_for_oracle)
+            except Exception:
+                _pre_injection = [dict(e) for e in events_for_oracle]
+            applied_changes = _apply_salary_changes(
+                events_for_oracle, facts.get("salary_changes", []), user_id, profile, req_date
+            )
+            evidence = {
+                "flags": sorted(facts.get("flags", set())),
+                "salary_changes": facts.get("salary_changes", []),
+                "income_facts": facts.get("income_facts", []),
+                "expense_facts": facts.get("expense_facts", []),
+                "event_updates": facts.get("event_updates", []),
+                "applied_salary_changes": applied_changes,
+                "event_amendment_notes": amendment_warnings,
+                "warnings": list(facts.get("warnings", [])) + list(amendment_warnings),
+                "notes": _evidence_notes(facts),
+            }
+        else:
+            try:
+                _pre_injection = _copy.deepcopy(events_for_oracle)
+            except Exception:
+                _pre_injection = [dict(e) for e in events_for_oracle]
 
-        # Flag stability: detect recurrence on the PRE-injection copy so a huge
-        # raise cannot drop the salary flag via CV (injection kept for amounts).
-        try:
-            _pre_injection = _copy.deepcopy(events_for_oracle)
-        except Exception:
-            _pre_injection = [dict(e) for e in events_for_oracle]
         recurrence_flags = detect_recurrence(_pre_injection)
-
-        # Salary-raise via event injection: add/amend a scheduled salary income
-        # event (category salary, event_type income) at the effective date.
-        # Raises effective after the 90-day window do not affect current safe (skipped).
-        try:
-            _req_d = date.fromisoformat(str(req_date).strip())
-            _win_end = _req_d + timedelta(days=90)
-        except Exception:
-            _req_d = None
-            _win_end = None
-        for update in updates.get("salary_updates", []):
-            eff = update.get("effective_date")
-            amt = update.get("amount")
-            if not eff or amt is None:
-                continue
-            try:
-                eff_s = str(eff).strip()
-                eff_d = date.fromisoformat(eff_s)
-            except Exception:
-                continue
-            if _win_end is not None and eff_d > _win_end:
-                continue
-            try:
-                amt_dec = Decimal(str(amt))
-            except Exception:
-                continue
-            ccy = update.get("currency") or profile.get("home_currency", "USD")
-            # Amend when a salary income row already exists on the effective date.
-            amended = False
-            for e in events_for_oracle:
-                if str(e.get("user_id", "") or "") not in ("", str(user_id)) and e.get("user_id") != user_id:
-                    continue
-                if e.get("category") == "salary" and str(e.get("event_type", "") or "").strip().lower() == "income":
-                    if e.get("settlement_date") == eff_s or e.get("event_date") == eff_s:
-                        e["amount"] = str(amt_dec)
-                        e["currency"] = str(ccy)
-                        # Ensure countable scheduled/settled income (leave failed/cancelled untouched).
-                        if str(e.get("status", "") or "").strip().lower() in ("", "nan", "none"):
-                            e["status"] = "scheduled"
-                        amended = True
-                        break
-            if not amended:
-                events_for_oracle.append({
-                    "event_id": f"salary_raise_{eff_s}",
-                    "user_id": user_id,
-                    "event_type": "income",
-                    "description": "Salary update via payroll message (injected)",
-                    "category": "salary",
-                    "direction": "credit",
-                    "amount": str(amt_dec),
-                    "currency": str(ccy),
-                    "event_date": eff_s,
-                    "settlement_date": eff_s,
-                    "status": "scheduled",
-                    "linked_event_id": "",
-                    "flexibility": "fixed",
-                    "minimum_allowed_amount": "",
-                })
     else:
         # No messages: flags from the (uninjected) oracle copy.
         recurrence_flags = detect_recurrence(events_for_oracle)
@@ -450,7 +576,8 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
                 "payment_plan": "none",
                 "earliest_date_for_full_payment": None,
                 "spending_changes_needed": "none",
-                "decision_explanation": "No viable payment options found."
+                "decision_explanation": "No viable payment options found.",
+                "evidence": evidence,
             }
 
     # Spec rank order: deadline âœ“, no changes, minimize total, start earlier, fewer legs, lowest option_id
@@ -474,5 +601,6 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
         "payment_plan": best["payment_plan"],
         "earliest_date_for_full_payment": earliest,
         "spending_changes_needed": best["spending_changes"],
-        "decision_explanation": f"Recommended {best['payment_method']} based on ranking."
+        "decision_explanation": f"Recommended {best['payment_method']} based on ranking.",
+        "evidence": evidence,
     }
