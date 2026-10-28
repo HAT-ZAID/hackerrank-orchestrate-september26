@@ -171,11 +171,15 @@ def test_protected_split_strips_whitespace_and_nan():
          "currency": "USD", "event_type": "expense", "event_id": "h3", "linked_event_id": ""},
     ]
     flags = {("u1", "rent", "expense")}
-    res = solve_safe_amount("u1", "2026-01-02", "5000", profile, evs, [], flags)
-    # Exact forecast: intervals [30,31] median-floor 30, last 2026-01-01 +30d
-    # => 2026-01-31 (day 29) at -1000 => 4000; day 0 still 5000.
-    assert res["ledger"][0] == Decimal("5000")
-    assert res["ledger"][29] == Decimal("4000")
+    # Task 8 re-base: with the monthly budget, the request-month bucket posts on
+    # the request date. Passing the suppression proves the parsed protected list
+    # still protects rent; a broken parser would drop the budget and keep 5000.
+    res = solve_safe_amount(
+        "u1", "2026-01-02", "5000", profile, evs, [], flags,
+        suppressed_categories={"rent"},
+    )
+    assert res["ledger"][0] == Decimal("4000")
+    assert {entry["category"] for entry in res["forecast"]} == {"rent"}
 
 
 def test_missing_keys_do_not_crash():

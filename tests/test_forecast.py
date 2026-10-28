@@ -1,10 +1,11 @@
-"""Forecast policy boundaries and the explicit oracle fail-closed contract (Task 3).
+"""Forecast policy boundaries and the explicit oracle fail-closed contract.
 
-Each test pins one policy rule from the brief, not a dataset row: discretionary
-spending is never projected, irregular income streams are not invented, an ended
-employment stops salary projection, only one primary salary stream is chosen,
-evidence expense facts move only their post-effective-date forecast, and an
-ambiguous ledger fails closed instead of returning a synthetic flat ledger.
+Each test pins one policy rule from a brief, not a dataset row: expenses are
+projected as one monthly budget per category (Task 8), discretionary spending is
+never projected, irregular income streams are not invented, an ended employment
+stops salary projection, only one primary salary stream is chosen, evidence
+expense facts move only their post-effective-date forecast, and an ambiguous
+ledger fails closed instead of returning a synthetic flat ledger.
 """
 from datetime import date
 from decimal import Decimal
@@ -61,6 +62,15 @@ def _flags(*groups):
 
 def _entries(result, kind):
     return [entry for entry in result.entries if entry.kind == kind]
+
+
+def _budget_entries(result):
+    """The monthly essential-budget rows (Task 8)."""
+    return [
+        entry
+        for entry in result.entries
+        if entry.kind == "expense" and entry.reason == "monthly_accrual"
+    ]
 
 
 # 1. Discretionary category is not forecast; essential category is.
@@ -257,8 +267,8 @@ def test_suppressed_category_removes_direct_forecast_and_reserve():
     assert groceries == []
 
 
-# 9. Uncovered essential-variable spend is reserved across the horizon.
-def test_uncovered_essential_variable_spend_is_reserved():
+# 9. The monthly budget covers every bucket of the 90-day horizon.
+def test_monthly_budget_covers_each_bucket_of_the_horizon():
     events = [
         _event("groceries_nov", "2025-11-05", "groceries", "300"),
         _event("groceries_dec", "2025-12-05", "groceries", "300"),
@@ -266,33 +276,229 @@ def test_uncovered_essential_variable_spend_is_reserved():
     ]
     result = build_forecast(events, "2026-02-01")
 
-    reserved = [entry for entry in _entries(result, "expense") if entry.source == "reserve"]
-    assert reserved
-    assert {entry.category for entry in reserved} == {"groceries"}
-    assert sum(abs(entry.amount) for entry in reserved) == Decimal("900")
+    budget = _budget_entries(result)
+    assert [entry.date for entry in budget] == [
+        date(2026, 2, 1),
+        date(2026, 3, 1),
+        date(2026, 4, 1),
+        date(2026, 5, 1),
+    ]
+    assert {entry.amount for entry in budget} == {Decimal("-300")}
+    assert {entry.source for entry in budget} == {"history"}
+    assert sum(abs(entry.amount) for entry in budget) == Decimal("1200")
 
 
-# 10. A recurring forecast for the same category offsets the reserve.
-def test_recurring_forecast_offsets_the_variable_reserve():
+# 10. A real in-window row offsets exactly one bucket: no double counting.
+def test_in_window_row_offsets_the_monthly_bucket():
     events = [
         _event("groceries_nov", "2025-11-05", "groceries", "300"),
         _event("groceries_dec", "2025-12-05", "groceries", "300"),
-        _event("groceries_jan", "2026-01-05", "groceries", "300"),
+        _event("groceries_feb", "2026-02-20", "groceries", "300", status="scheduled"),
     ]
+    result = build_forecast(events, "2026-02-01")
+
+    budget = _budget_entries(result)
+    # The bucket holding the real row is fully covered; the other three are not.
+    assert [entry.date for entry in budget] == [
+        date(2026, 3, 1),
+        date(2026, 4, 1),
+        date(2026, 5, 1),
+    ]
+    assert {entry.amount for entry in budget} == {Decimal("-300")}
+
+
+# --- Task 8: monthly essential-budget accrual -------------------------------
+
+
+def test_two_months_of_history_produce_a_monthly_budget_on_the_request_date():
+    events = [
+        _event("groceries_nov", "2025-11-05", "groceries", "100"),
+        _event("groceries_dec", "2025-12-05", "groceries", "300"),
+    ]
+    result = build_forecast(events, "2026-01-10")
+
+    budget = _budget_entries(result)
+    assert budget, "two months of history must produce a budget"
+    first = budget[0]
+    assert first.date == date(2026, 1, 10)
+    assert first.category == "groceries"
+    # Median of the monthly totals (100, 300), not the monthly sum.
+    assert first.amount == Decimal("-200")
+    assert [entry.date for entry in budget] == [
+        date(2026, 1, 10),
+        date(2026, 2, 10),
+        date(2026, 3, 10),
+        date(2026, 4, 10),
+    ]
+
+
+def test_a_single_month_of_history_is_not_projected():
+    events = [_event("groceries_dec", "2025-12-05", "groceries", "300")]
+    result = build_forecast(events, "2026-01-10")
+
+    assert _budget_entries(result) == []
+
+
+def test_real_in_window_rows_reduce_the_bucket_without_going_negative():
+    history = [
+        _event("groceries_nov", "2025-11-05", "groceries", "300"),
+        _event("groceries_dec", "2025-12-05", "groceries", "300"),
+    ]
+
+    def first_bucket(real_amount, status="pending"):
+        real = _event("groceries_real", "2026-01-20", "groceries", real_amount, status=status)
+        result = build_forecast(history + [real], "2026-01-10")
+        return result, [entry for entry in _budget_entries(result) if entry.date == date(2026, 1, 10)]
+
+    result, first = first_bucket("120")
+    assert first and first[0].amount == Decimal("-180")
+
+    # Coverage may not exceed the budget: the bucket disappears instead of
+    # producing a negative expense, and later buckets stay at the full budget.
+    result, first = first_bucket("400")
+    assert first == []
+    assert {entry.amount for entry in _budget_entries(result)} == {Decimal("-300")}
+    assert all(entry.amount < 0 for entry in result.entries)
+
+
+def _salary_history():
+    return [
+        _event(
+            f"salary_{month}",
+            f"{month}-05",
+            "salary",
+            "2000",
+            event_type="income",
+            direction="credit",
+            description="Payroll credit",
+        )
+        for month in ("2025-10", "2025-11", "2025-12", "2026-01")
+    ]
+
+
+def _groceries_history():
+    return [
+        _event("groceries_nov", "2025-11-05", "groceries", "300"),
+        _event("groceries_dec", "2025-12-05", "groceries", "300"),
+    ]
+
+
+def test_first_bucket_is_prorated_when_a_salary_is_projected():
+    result = build_forecast(_salary_history() + _groceries_history(), "2026-01-20")
+
+    assert _entries(result, "income"), "the fixture must project a salary"
+    first = [entry for entry in _budget_entries(result) if entry.date == date(2026, 1, 20)]
+    assert first, _budget_entries(result)
+    # 12 days left in January: 300 * (12 + 1) / 30.
+    assert first[0].amount == Decimal("-130")
+
+
+def test_first_bucket_is_not_prorated_without_a_projected_salary():
+    result = build_forecast(_groceries_history(), "2026-01-20")
+    assert _entries(result, "income") == []
+    first = [entry for entry in _budget_entries(result) if entry.date == date(2026, 1, 20)]
+    assert first and first[0].amount == Decimal("-300")
+
+    # The gate is the *projected* salary, not the history: ended employment stops
+    # the projection, so the request month is reserved in full again.
+    ended = build_forecast(
+        _salary_history() + _groceries_history(),
+        "2026-01-20",
+        evidence_flags={"employment_ended"},
+    )
+    assert _entries(ended, "income") == []
+    first = [entry for entry in _budget_entries(ended) if entry.date == date(2026, 1, 20)]
+    assert first and first[0].amount == Decimal("-300")
+
+
+def test_stop_removes_the_budget_and_a_protected_stop_is_ignored_with_a_warning():
+    stopped = build_forecast(
+        _groceries_history(), "2026-01-10", suppressed_categories={"groceries"}
+    )
+    assert [entry for entry in stopped.entries if entry.category == "groceries"] == []
+
+    protected = build_forecast(
+        _groceries_history(),
+        "2026-01-10",
+        suppressed_categories={"groceries"},
+        protected_categories={"groceries"},
+    )
+    assert _budget_entries(protected), "a protected category is never suppressed"
+    flags = {warning["flag"] for warning in protected.warnings}
+    assert "PROTECTED_CATEGORY_NOT_SUPPRESSED" in flags
+
+
+def test_reduce_to_sets_the_monthly_budget_and_keeps_the_category():
     result = build_forecast(
-        events,
-        "2026-02-01",
-        recurrence_flags=_flags(("u1", "groceries", "expense")),
+        _groceries_history(),
+        "2026-01-10",
+        category_overrides={"groceries": Decimal("50")},
     )
 
-    reserved = [entry for entry in _entries(result, "expense") if entry.source == "reserve"]
-    assert reserved == []
-    recurring = [
-        entry
-        for entry in _entries(result, "expense")
-        if entry.source == "history" and entry.category == "groceries"
+    budget = _budget_entries(result)
+    assert budget, "an override keeps the category in the forecast"
+    assert {entry.category for entry in budget} == {"groceries"}
+    assert {entry.amount for entry in budget} == {Decimal("-50")}
+    assert Decimal("-300") not in {entry.amount for entry in result.entries}
+
+
+def test_a_spending_change_override_wins_over_a_conflicting_expense_fact():
+    fact = {
+        "category": "groceries",
+        "kind": "increase",
+        "amount": None,
+        "currency": "",
+        "effective_date": "2026-01-01",
+        "percent_change": Decimal("100"),
+        "source_message_id": "message_test",
+    }
+    result = build_forecast(
+        _groceries_history(),
+        "2026-01-10",
+        category_overrides={"groceries": Decimal("50")},
+        expense_facts=[fact],
+    )
+
+    # Control: the fact alone doubles the budget, so the assertions below prove
+    # the override replaced it rather than stacking on top of it.
+    control = build_forecast(_groceries_history(), "2026-01-10", expense_facts=[fact])
+    control_expenses = [entry for entry in control.entries if entry.kind == "expense"]
+    assert control_expenses
+    assert {entry.amount for entry in control_expenses} == {Decimal("-600")}
+
+    budget = _budget_entries(result)
+    assert budget, "the override keeps the category"
+    assert {entry.amount for entry in budget} == {Decimal("-50")}
+    assert Decimal("-600") not in {entry.amount for entry in result.entries}
+    flags = {warning["flag"] for warning in result.warnings}
+    assert "EXPENSE_FACT_OVERRIDDEN_BY_SPENDING_CHANGE" in flags
+
+
+def test_monthly_budget_entries_are_deterministic_and_sorted():
+    events = _groceries_history() + [
+        _event("streaming_nov", "2025-11-09", "streaming", "20", event_type="subscription"),
+        _event("streaming_dec", "2025-12-09", "streaming", "20", event_type="subscription"),
     ]
-    assert len(recurring) == 3
+    first = build_forecast(events, "2026-01-10")
+    second = build_forecast(events, "2026-01-10")
+
+    signature = lambda result: [
+        (entry.date, entry.category, entry.kind, entry.source, entry.reason, entry.amount)
+        for entry in result.entries
+    ]
+    assert signature(first) == signature(second)
+    keys = [(entry.date, entry.category, entry.kind, entry.source, entry.reason) for entry in first.entries]
+    assert keys == sorted(keys)
+    assert {(entry.date, entry.category) for entry in _budget_entries(first)} == {
+        (date(2026, 1, 10), "groceries"),
+        (date(2026, 1, 10), "streaming"),
+        (date(2026, 2, 10), "groceries"),
+        (date(2026, 2, 10), "streaming"),
+        (date(2026, 3, 10), "groceries"),
+        (date(2026, 3, 10), "streaming"),
+        (date(2026, 4, 10), "groceries"),
+        (date(2026, 4, 10), "streaming"),
+    }
 
 
 # 11. solve_safe_amount returns fail_closed=True with an empty ledger on STATUS_UNKNOWN.

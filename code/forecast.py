@@ -1,26 +1,36 @@
-"""Forecast policy for the daily ledger (Task 3).
+"""Forecast policy for the daily ledger.
 
 The oracle answers one question: *how much cash can this user safely commit on
 the request date without dropping below ``minimum_balance_to_keep`` anywhere in
 the 90-day horizon?*  This module supplies the only forward-looking cash rows the
 ledger may contain, under an explicit, conservative policy:
 
-* only committed/essential expense categories are projected (:data:`FORECASTABLE_EXPENSE_CATEGORIES`);
-  discretionary spending (:data:`DISCRETIONARY_CATEGORIES`) is never invented
-  forward;
-* an expense amount is the **median** of its eligible history, so a one-off
-  outlier cannot dominate the projection;
+* expenses are projected as **one monthly budget per committed category**
+  (:data:`FORECASTABLE_EXPENSE_CATEGORIES`); discretionary spending
+  (:data:`DISCRETIONARY_CATEGORIES`) is never invented forward;
+* the budget is the **median of the monthly home-currency totals** of the
+  category's eligible history, so a one-off month or a single outlier cannot
+  dominate it, and two months of history are required before a category is
+  projected at all;
+* the budget posts on the request date and on each following month boundary of
+  the horizon, net of the real countable rows already inside that month, so
+  nothing is double counted and no bucket goes negative;
+* the request month is prorated to its remaining days **only when the window
+  contains a projected salary**: proration assumes the rest of the month is
+  funded by the rest of the month's income;
 * at most **one** regular salary stream is projected, chosen by cadence and
   amount stability, and never more than two occurrences inside the horizon;
 * gig/platform/freelance/commission/bonus/arrears/prize/seasonal/temporary/
   final/prorated/secondary streams are never projected, and an ended employment
   stops projection entirely;
+* a permitted spending change moves the budget: ``stop`` removes the category,
+  ``reduce_to`` replaces its monthly budget and keeps it;
 * typed evidence expense facts (percent increase, explicit new amount, ended
   category) move only the forecast rows on or after their effective date.  An
   ambiguous fact leaves the forecast unchanged and is reported as a warning.
 
 Everything is deterministic: no randomness, no live data, no LLM.  Entries are
-sorted by date, category, kind and source.
+sorted by date, category, kind, source and reason.
 """
 from __future__ import annotations
 
@@ -33,6 +43,12 @@ from code.fx import resolve_rate
 HORIZON_DAYS = 90
 DEFAULT_INTERVAL_DAYS = 30
 MAX_INCOME_OCCURRENCES = 2
+# A monthly budget needs at least two observed months: one month is a one-off.
+MIN_BUDGET_MONTHS = 2
+# A calendar month is charged as 30 days when prorating the request month.
+PRORATION_DAYS_PER_MONTH = 30
+# Latest calendar day a monthly budget boundary may land on.
+MAX_BUCKET_DAY = 28
 
 # Committed / essential categories the ledger may project forward.
 FORECASTABLE_EXPENSE_CATEGORIES = frozenset(
@@ -58,18 +74,8 @@ FORECASTABLE_EXPENSE_CATEGORIES = frozenset(
 # Lifestyle spending: never extrapolated into the future, even when it recurs.
 DISCRETIONARY_CATEGORIES = frozenset({"dining", "entertainment", "shopping"})
 
-# Essential spending that is variable rather than a fixed recurring bill.  The
-# recurring forecast can miss part of this spend; the uncovered remainder is
-# reserved conservatively over the horizon.
-ESSENTIAL_VARIABLE_CATEGORIES = frozenset(
-    {"groceries", "transport", "utilities", "healthcare", "education", "family_support"}
-)
-VARIABLE_RESERVE_BUCKET_DAYS = 30
-MIN_VARIABLE_RESERVE_MONTHS = 2
-
-# Event types that can carry recurring committed expense history.  The oracle's
-# historical filter is preserved (Task 3 brief: keep event filtering); a
-# `debt_payment` row is a cash event but not a recurring *expense* history row.
+# Event types that can carry committed expense history.  A `debt_payment` row is a
+# cash event but not a *expense* history row.
 EXPENSE_EVENT_TYPES = frozenset({"expense", "subscription"})
 
 # Only a regular salary can be projected as income.
@@ -224,17 +230,6 @@ def _cv(values: list[Decimal]) -> Decimal:
     return variance.sqrt() / abs(mean)
 
 
-def _normalized_flags(recurrence_flags) -> set[tuple[str, str, str]]:
-    flags: set[tuple[str, str, str]] = set()
-    for flag in recurrence_flags or ():
-        try:
-            user_id, category, event_type = flag
-        except (TypeError, ValueError):
-            continue
-        flags.add((_text(user_id), _norm(category), _norm(event_type)))
-    return flags
-
-
 def _event_day(event: dict) -> date | None:
     return _as_date(event.get("settlement_date") or event.get("event_date"))
 
@@ -272,42 +267,52 @@ def _fact_value(fact, key: str):
 
 
 # ---------------------------------------------------------------------------
-# Expense projection
+# Expense projection: one monthly budget per committed category
 # ---------------------------------------------------------------------------
 
 
-def _expense_history(
+def _first_day_of_next_month(day: date) -> date:
+    """First day of the calendar month after ``day``."""
+    year = day.year + (1 if day.month == 12 else 0)
+    month = 1 if day.month == 12 else day.month + 1
+    return date(year, month, 1)
+
+
+def _next_bucket_start(day: date) -> date:
+    """Next month boundary inside the horizon (``min(day, 28)`` like the plan)."""
+    year = day.year + (1 if day.month == 12 else 0)
+    month = 1 if day.month == 12 else day.month + 1
+    return date(year, month, min(day.day, MAX_BUCKET_DAY))
+
+
+def _eligible_expense_rows(
     events,
-    req_date: date,
     *,
-    user_id: str,
+    categories,
     home_currency: str,
     fx_rows,
-    flags: set[tuple[str, str, str]],
-    warnings: list[dict],
-) -> dict[str, dict]:
-    """Per-category (dates, home-currency magnitudes) history before the request."""
-    history: dict[str, dict] = {}
+    warnings: list[dict] | None = None,
+    warn_on_fx: bool = False,
+) -> list[tuple[str, date, Decimal]]:
+    """Countable expense rows of the projected categories, in home currency.
+
+    History and in-window coverage share this one eligibility rule: expense or
+    subscription rows of the category, settled/scheduled/pending debits (a pending
+    debit is reserved cash), a positive amount, and a known FX rate on the row's
+    own date.  An unconvertible amount is skipped and, for history, reported.
+    """
+    rows: list[tuple[str, date, Decimal]] = []
     for event in events:
         category = _norm(event.get("category"))
-        if category not in FORECASTABLE_EXPENSE_CATEGORIES:
+        if category not in categories:
             continue
-        if category in DISCRETIONARY_CATEGORIES:
-            continue
-        event_type = _norm(event.get("event_type"))
-        if event_type not in EXPENSE_EVENT_TYPES:
-            continue
-        if (user_id, category, event_type) not in flags:
+        if _norm(event.get("event_type")) not in EXPENSE_EVENT_TYPES:
             continue
         if not _counts_as_history(event, income=False):
             continue
         event_day = _event_day(event)
-        if event_day is None or event_day >= req_date:
+        if event_day is None:
             continue
-        # Cadence evidence comes from every countable row of the category: a
-        # row whose rate is unknown still happened on that date.
-        bucket = history.setdefault(category, {"dates": [], "amounts": []})
-        bucket["dates"].append(event_day)
         amount = _decimal(event.get("amount"))
         if amount is None or amount <= 0:
             continue
@@ -315,273 +320,140 @@ def _expense_history(
             fx_rows, _text(event.get("currency")), home_currency, event_day.isoformat()
         )["rate"]
         if rate is None:
-            # Never invent a rate; skip the observation rather than pollute the
-            # median with raw foreign units.
-            warnings.append(
-                _warning(
-                    "FORECAST_HISTORY_FX_UNKNOWN",
-                    "",
-                    f"skipped {category} observation on {event_day.isoformat()}",
-                    category,
-                )
-            )
-            continue
-        bucket["amounts"].append(abs(amount * rate))
-    return history
-
-
-def _expense_forecast(
-    events,
-    req_date: date,
-    window_end: date,
-    *,
-    user_id: str,
-    home_currency: str,
-    fx_rows,
-    recurrence_flags,
-    suppressed: set[str],
-    protected: set[str],
-    warnings: list[dict],
-    overrides: dict[str, Decimal] | None = None,
-) -> list[ForecastEntry]:
-    flags = _normalized_flags(recurrence_flags)
-    overrides = overrides or {}
-    history = _expense_history(
-        events,
-        req_date,
-        user_id=user_id,
-        home_currency=home_currency,
-        fx_rows=fx_rows,
-        flags=flags,
-        warnings=warnings,
-    )
-    # Dates already carrying a countable row for the category: never double count.
-    existing: set[tuple[str, date]] = set()
-    for event in events:
-        category = _norm(event.get("category"))
-        event_day = _event_day(event)
-        if event_day is None or not (req_date <= event_day <= window_end):
-            continue
-        if _norm(event.get("direction")) == "non_cash":
-            continue
-        if _norm(event.get("status")) in _EXCLUDED_HISTORY_STATUSES:
-            continue
-        existing.add((category, event_day))
-
-    entries: list[ForecastEntry] = []
-    for category in sorted(history):
-        bucket = history[category]
-        dates: list[date] = bucket["dates"]
-        # Recurrence needs at least two dated observations, and the amount
-        # projection needs at least one convertible amount.
-        if len(dates) < 2 or not bucket["amounts"]:
-            continue
-        if category in suppressed:
-            if category in protected:
+            if warn_on_fx and warnings is not None:
                 warnings.append(
                     _warning(
-                        "PROTECTED_CATEGORY_NOT_SUPPRESSED",
+                        "FORECAST_HISTORY_FX_UNKNOWN",
                         "",
-                        f"{category} is protected; the suppression was ignored",
+                        f"skipped {category} observation on {event_day.isoformat()}",
                         category,
                     )
                 )
-            else:
-                # A spending change stops this category forward.  Historical
-                # amounts stay in the ledger; only the projection disappears.
-                continue
-        interval = _median_int(
-            [
-                (sorted(dates)[index + 1] - sorted(dates)[index]).days
-                for index in range(len(dates) - 1)
-            ]
-        )
-        if interval <= 0:
-            interval = DEFAULT_INTERVAL_DAYS
-        amount = -abs(_median_decimal(bucket["amounts"]))
-        # A `reduce_to` spending change replaces the projected run-rate with the
-        # new amount; the category stays in the forecast (no suppression).
-        if category in overrides:
-            amount = -abs(overrides[category])
-        next_date = max(dates) + timedelta(days=interval)
-        while next_date < req_date:
-            next_date += timedelta(days=interval)
-        while next_date <= window_end:
-            if (category, next_date) not in existing:
-                entries.append(
-                    ForecastEntry(
-                        date=next_date,
-                        amount=amount,
-                        category=category,
-                        kind="expense",
-                        source="history",
-                        reason="recurring_median",
-                    )
-                )
-            next_date += timedelta(days=interval)
-    return entries
+            continue
+        rows.append((category, event_day, abs(amount * rate)))
+    return rows
 
 
-def _essential_variable_history(
+def _monthly_budget_history(
     events,
     req_date: date,
     *,
     home_currency: str,
     fx_rows,
     warnings: list[dict],
-) -> dict[str, list[Decimal]]:
-    """Median monthly home-currency spend per essential-variable category.
+) -> dict[str, Decimal]:
+    """Median monthly home-currency total per forecastable category.
 
-    Only complete months before the request month count: a partial request month
-    would understate typical spend and weaken the reserve.  At least two months
-    are required, so a single observation never becomes a recurring assumption.
+    Every countable row before ``req_date`` counts, including the partial request
+    month up to the day before the request.  A month without a convertible amount
+    contributes no total (no zero months are invented), and a category needs at
+    least :data:`MIN_BUDGET_MONTHS` observed months before it becomes a budget.
     """
+    projected = FORECASTABLE_EXPENSE_CATEGORIES - DISCRETIONARY_CATEGORIES
     monthly: dict[str, dict[tuple[int, int], Decimal]] = {}
-    for event in events:
-        category = _norm(event.get("category"))
-        if category not in ESSENTIAL_VARIABLE_CATEGORIES:
+    for category, event_day, amount in _eligible_expense_rows(
+        events,
+        categories=projected,
+        home_currency=home_currency,
+        fx_rows=fx_rows,
+        warnings=warnings,
+        warn_on_fx=True,
+    ):
+        if event_day >= req_date:
             continue
-        if _norm(event.get("event_type")) not in EXPENSE_EVENT_TYPES:
-            continue
-        if not _counts_as_history(event, income=False):
-            continue
-        event_day = _event_day(event)
-        if event_day is None or event_day >= req_date:
-            continue
-        if (event_day.year, event_day.month) >= (req_date.year, req_date.month):
-            continue
-        amount = _decimal(event.get("amount"))
-        if amount is None or amount <= 0:
-            continue
-        rate = resolve_rate(
-            fx_rows, _text(event.get("currency")), home_currency, event_day.isoformat()
-        )["rate"]
-        if rate is None:
-            warnings.append(
-                _warning(
-                    "FORECAST_HISTORY_FX_UNKNOWN",
-                    "",
-                    f"skipped {category} reserve observation on {event_day.isoformat()}",
-                    category,
-                )
-            )
-            continue
-        month_key = (event_day.year, event_day.month)
         bucket = monthly.setdefault(category, {})
-        bucket[month_key] = bucket.get(month_key, Decimal(0)) + abs(amount * rate)
+        month_key = (event_day.year, event_day.month)
+        bucket[month_key] = bucket.get(month_key, Decimal(0)) + amount
 
-    history: dict[str, list[Decimal]] = {}
+    budgets: dict[str, Decimal] = {}
     for category, months in monthly.items():
-        if len(months) < MIN_VARIABLE_RESERVE_MONTHS:
+        if len(months) < MIN_BUDGET_MONTHS:
             continue
-        history[category] = sorted(months.values())
-    return history
+        budgets[category] = _median_decimal(sorted(months.values()))
+    return budgets
 
 
-def _essential_variable_reserve(
+def _real_in_window_expenses(
+    events,
+    req_date: date,
+    window_end: date,
+    *,
+    categories,
+    home_currency: str,
+    fx_rows,
+) -> dict[str, list[tuple[date, Decimal]]]:
+    """Countable real rows inside the window, per budgeted category."""
+    real: dict[str, list[tuple[date, Decimal]]] = {}
+    for category, event_day, amount in _eligible_expense_rows(
+        events,
+        categories=categories,
+        home_currency=home_currency,
+        fx_rows=fx_rows,
+    ):
+        if not (req_date <= event_day <= window_end):
+            continue
+        real.setdefault(category, []).append((event_day, amount))
+    return real
+
+
+def _monthly_budget_forecast(
     events,
     req_date: date,
     window_end: date,
     *,
     home_currency: str,
     fx_rows,
-    covered_entries: list[ForecastEntry],
-    expense_facts,
-    warnings: list[dict],
-    skipped_categories=None,
+    budgets: dict[str, Decimal],
+    has_projected_income: bool,
 ) -> list[ForecastEntry]:
-    """Reserve essential variable spend not already covered by committed rows.
+    """Post each category's monthly budget on the horizon's month boundaries.
 
-    Each 30-day bucket reserves ``max(0, median_monthly_spend - covered)`` where
-    ``covered`` is the recurring forecast plus real countable in-window rows for
-    the same category.  Reserve rows post at the bucket start, so the ledger sees
-    the outflow conservatively early.  An ended-expense fact suppresses reserve
-    buckets on/after its effective date.  ``skipped_categories`` mirrors the
-    unprotected suppressions applied by the direct forecast, plus categories
-    whose forward run-rate a ``reduce_to`` change already fixed exactly (that
-    override *is* the committed spend, so no median top-up applies).
+    The first bucket starts on the request date and is prorated to the remaining
+    days of the request month only when a salary is projected in the window.
+    Every bucket is net of the real countable rows it already contains.
     """
-    skipped = {_norm(category) for category in (skipped_categories or ()) if _norm(category)}
-    history = _essential_variable_history(
+    if not budgets:
+        return []
+    real = _real_in_window_expenses(
         events,
         req_date,
+        window_end,
+        categories=set(budgets),
         home_currency=home_currency,
         fx_rows=fx_rows,
-        warnings=warnings,
     )
-    if not history:
-        return []
-
-    real_rows: dict[str, list[tuple[date, Decimal]]] = {}
-    for event in events:
-        category = _norm(event.get("category"))
-        if category not in ESSENTIAL_VARIABLE_CATEGORIES:
-            continue
-        if _norm(event.get("event_type")) not in EXPENSE_EVENT_TYPES:
-            continue
-        if not _counts_as_history(event, income=False):
-            continue
-        event_day = _event_day(event)
-        if event_day is None or not (req_date <= event_day <= window_end):
-            continue
-        amount = _decimal(event.get("amount"))
-        if amount is None or amount <= 0:
-            continue
-        rate = resolve_rate(
-            fx_rows, _text(event.get("currency")), home_currency, event_day.isoformat()
-        )["rate"]
-        if rate is None:
-            continue
-        real_rows.setdefault(category, []).append((event_day, abs(amount * rate)))
-
-    ended_effective: dict[str, date] = {}
-    for fact in expense_facts or ():
-        category = _norm(_fact_value(fact, "category"))
-        if not category or _norm(_fact_value(fact, "kind")) not in _EXPENSE_END_FACT_KINDS:
-            continue
-        effective = _as_date(_fact_value(fact, "effective_date"))
-        if effective is None:
-            continue
-        current = ended_effective.get(category)
-        ended_effective[category] = effective if current is None else min(current, effective)
+    days_left = (_first_day_of_next_month(req_date) - req_date).days
 
     entries: list[ForecastEntry] = []
-    for category in sorted(history):
-        if category in skipped:
-            continue
-        monthly_median = _median_decimal(history[category])
-        for offset in range(0, HORIZON_DAYS, VARIABLE_RESERVE_BUCKET_DAYS):
-            bucket_start = req_date + timedelta(days=offset)
-            if bucket_start > window_end:
-                break
-            ended_on = ended_effective.get(category)
-            if ended_on is not None and bucket_start >= ended_on:
-                continue
-            bucket_end = bucket_start + timedelta(days=VARIABLE_RESERVE_BUCKET_DAYS)
-            covered = Decimal(0)
-            for entry in covered_entries:
-                if (
-                    entry.kind == "expense"
-                    and entry.category == category
-                    and bucket_start <= entry.date < bucket_end
-                ):
-                    covered += abs(entry.amount)
-            for event_day, amount in real_rows.get(category, ()):
-                if bucket_start <= event_day < bucket_end:
-                    covered += amount
-            uncovered = monthly_median - covered
+    cursor = req_date
+    first = True
+    while cursor <= window_end:
+        bucket_end = _next_bucket_start(cursor)
+        for category in sorted(budgets):
+            amount = budgets[category]
+            if first and has_projected_income:
+                amount = (
+                    amount * Decimal(days_left + 1) / Decimal(PRORATION_DAYS_PER_MONTH)
+                )
+            covered = sum(
+                (value for day, value in real.get(category, ()) if cursor <= day < bucket_end),
+                Decimal(0),
+            )
+            uncovered = max(Decimal(0), amount - covered)
             if uncovered <= 0:
                 continue
             entries.append(
                 ForecastEntry(
-                    date=bucket_start,
+                    date=cursor,
                     amount=-uncovered,
                     category=category,
                     kind="expense",
-                    source="reserve",
-                    reason="uncovered_essential_variable_spend",
+                    source="history",
+                    reason="monthly_accrual",
                 )
             )
+        first = False
+        cursor = bucket_end
     return entries
 
 
@@ -952,12 +824,15 @@ def build_forecast(
     filters and dedups before calling).  Every policy input is explicit so the
     result is reproducible and unit-testable without pandas.
 
-    ``category_overrides`` maps a category to the forward amount a permitted
-    ``reduce_to`` spending change sets: the category keeps recurring, at exactly
-    that amount, instead of at its historical median (and instead of being
-    suppressed like a ``stop``).  The essential-variable reserve is skipped for
-    an overridden category that actually has forward entries, because the
-    override *is* its committed run-rate.
+    ``suppressed_categories`` removes a stopped category's monthly budget;
+    ``category_overrides`` replaces a ``reduce_to`` category's monthly budget with
+    the new amount and keeps the category.  A protected category is never
+    silently suppressed.  Income is projected first, because the request month is
+    only prorated when a salary is actually projected in the window.
+
+    ``recurrence_flags`` is accepted for caller compatibility (the oracle passes
+    it) but no longer selects what is projected: a monthly budget is evidence of
+    two observed months, not of a per-transaction cadence.
     """
     request_day = _as_date(req_date)
     if request_day is None:
@@ -983,41 +858,6 @@ def build_forecast(
             overrides[name] = abs(amount)
 
     warnings: list[dict] = []
-    expense_entries = _expense_forecast(
-        events,
-        request_day,
-        window_end,
-        user_id=user_id,
-        home_currency=home_currency,
-        fx_rows=fx_rows,
-        recurrence_flags=recurrence_flags,
-        suppressed=suppressed,
-        protected=protected,
-        warnings=warnings,
-        overrides=overrides,
-    )
-    expense_entries = _apply_expense_facts(
-        expense_entries,
-        expense_facts,
-        window_end=window_end,
-        home_currency=home_currency,
-        fx_rows=fx_rows,
-        warnings=warnings,
-    )
-    overridden_with_entries = {
-        entry.category for entry in expense_entries if entry.category in overrides
-    }
-    expense_entries = expense_entries + _essential_variable_reserve(
-        events,
-        request_day,
-        window_end,
-        home_currency=home_currency,
-        fx_rows=fx_rows,
-        covered_entries=expense_entries,
-        expense_facts=expense_facts,
-        warnings=warnings,
-        skipped_categories=(suppressed - protected) | overridden_with_entries,
-    )
     income_entries, income_stream = _income_forecast(
         events,
         request_day,
@@ -1029,6 +869,69 @@ def build_forecast(
         warnings=warnings,
     )
 
+    budgets = _monthly_budget_history(
+        events,
+        request_day,
+        home_currency=home_currency,
+        fx_rows=fx_rows,
+        warnings=warnings,
+    )
+    for category in sorted(budgets):
+        if category not in suppressed:
+            continue
+        if category in protected:
+            warnings.append(
+                _warning(
+                    "PROTECTED_CATEGORY_NOT_SUPPRESSED",
+                    "",
+                    f"{category} is protected; the suppression was ignored",
+                    category,
+                )
+            )
+            continue
+        del budgets[category]
+    for category, amount in overrides.items():
+        # A reduce_to sets the forward run-rate; without a budget there is nothing
+        # to move, and the change stays a no-op (the ledger identity check drops it).
+        if category in budgets:
+            budgets[category] = amount
+
+    # A spending-change override wins over an evidence fact for the same category:
+    # the user's explicit plan change is the committed spend, so the fact is
+    # reported instead of silently applied on top.
+    applicable_facts: list[dict] = []
+    for fact in expense_facts or ():
+        category = _norm(_fact_value(fact, "category"))
+        if category and category in overrides and category in budgets:
+            warnings.append(
+                _warning(
+                    "EXPENSE_FACT_OVERRIDDEN_BY_SPENDING_CHANGE",
+                    _text(_fact_value(fact, "source_message_id")),
+                    f"spending-change override for {category} wins over the expense fact",
+                    category,
+                )
+            )
+            continue
+        applicable_facts.append(fact)
+
+    expense_entries = _monthly_budget_forecast(
+        events,
+        request_day,
+        window_end,
+        home_currency=home_currency,
+        fx_rows=fx_rows,
+        budgets=budgets,
+        has_projected_income=any(entry.kind == "income" for entry in income_entries),
+    )
+    expense_entries = _apply_expense_facts(
+        expense_entries,
+        applicable_facts,
+        window_end=window_end,
+        home_currency=home_currency,
+        fx_rows=fx_rows,
+        warnings=warnings,
+    )
+
     entries = expense_entries + income_entries
     entries.sort(key=lambda entry: (entry.date, entry.category, entry.kind, entry.source, entry.reason))
     return ForecastResult(entries=entries, warnings=warnings, income_stream=income_stream)
@@ -1036,7 +939,6 @@ def build_forecast(
 
 __all__ = [
     "DISCRETIONARY_CATEGORIES",
-    "ESSENTIAL_VARIABLE_CATEGORIES",
     "EXPENSE_EVENT_TYPES",
     "EXCLUDED_INCOME_DESCRIPTION_TOKENS",
     "FORECASTABLE_EXPENSE_CATEGORIES",
@@ -1045,6 +947,7 @@ __all__ = [
     "HORIZON_DAYS",
     "INCOME_END_FLAGS",
     "MAX_INCOME_OCCURRENCES",
+    "MIN_BUDGET_MONTHS",
     "PRIMARY_INCOME_CATEGORIES",
     "build_forecast",
 ]

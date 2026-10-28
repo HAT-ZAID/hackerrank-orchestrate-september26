@@ -247,7 +247,8 @@ def test_reduce_to_overrides_the_forward_run_rate_and_keeps_the_category():
     events = _subscription_history()
     flags = {("u1", "cloud_storage", "subscription")}
     base = solve_safe_amount("u1", "2026-04-01", "1000", profile, events, [], flags)
-    assert base["safe_amount"] == Decimal("880"), base
+    # Task 8: the category is a 30/month budget posted on 2026-04-01, 05-01, 06-01.
+    assert base["safe_amount"] == Decimal("910"), base
 
     action = {"event_id": "cloud_storage_2", "action": "reduce_to",
               "value": Decimal("10"), "category": "cloud_storage"}
@@ -259,7 +260,7 @@ def test_reduce_to_overrides_the_forward_run_rate_and_keeps_the_category():
     forward = [e for e in res["forecast"] if e["category"] == "cloud_storage"]
     assert forward, "reduce_to must keep the category in the forward forecast"
     assert {Decimal(e["amount"]) for e in forward} == {Decimal("-10")}
-    assert res["safe_amount"] == Decimal("960"), res
+    assert res["safe_amount"] == Decimal("970"), res
     # The in-window copy of the targeted row carries the new amount, not zero.
     assert next(e for e in modified if e["event_id"] == "cloud_storage_2")["amount"] == "10"
 
