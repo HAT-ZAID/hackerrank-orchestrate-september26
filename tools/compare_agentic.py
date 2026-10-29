@@ -67,7 +67,7 @@ def _trace_usage(trace_path) -> dict:
     return usage if isinstance(usage, dict) else {}
 
 
-def _run(limit, provider_name, trace_dir, timeout_s):
+def _run(limit, provider_name, trace_dir, timeout_s, max_turns=None, max_tool_calls=None):
     """Run the pipeline twice: plain kernel, then the agentic slice."""
     from code.main import run_pipeline
     from code.providers import build_provider
@@ -76,13 +76,20 @@ def _run(limit, provider_name, trace_dir, timeout_s):
 
     provider, reason = (None, None) if provider_name == "none" else build_provider()
     recorded: dict = {}
+    # Only override the product budget when the caller asks for it, so the
+    # comparison keeps the shipped limits by default.
+    budget = {}
+    if max_turns is not None:
+        budget["max_provider_calls"] = max_turns
+    if max_tool_calls is not None:
+        budget["max_tool_calls"] = max_tool_calls
 
     def instrumented(context, *, provider, tools, trace):
         from code.agent import run_agent_loop
 
         started = time.monotonic()
         outcome = run_agent_loop(
-            context, provider=provider, tools=tools, trace=trace, timeout_s=timeout_s
+            context, provider=provider, tools=tools, trace=trace, timeout_s=timeout_s, **budget
         )
         recorded[outcome.request_id] = {
             "seconds": round(time.monotonic() - started, 3),
@@ -221,6 +228,18 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--out", default="docs/agentic-vs-deterministic.md")
     parser.add_argument("--json", default=None, help="also write the raw comparison as JSON")
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="override the agent's model-call budget (default: the shipped limit of 6)",
+    )
+    parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=None,
+        help="override the agent's tool-call budget (default: the shipped limit of 6)",
+    )
     args = parser.parse_args(argv)
 
     if args.limit <= 0:

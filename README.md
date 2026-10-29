@@ -219,10 +219,11 @@ unproven and report anything it breaks.
   quality gate (G2), with `recommended_payment_method`, `payment_plan`,
   `earliest_date_for_full_payment` and spending-change rows the main gaps.
 - Image reading is local but uneven. On the 16 linked images Tesseract and
-  Qwen3-VL 2B both resolve 15; `image_14` stays unresolved. The 2B model returns
-  unusable answers on some layouts, so the deterministic parser stays the
-  authority and the model is only a reader — see
-  [`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
+  Qwen3-VL 2B both resolve 15 and agree on 14 of those, so the 2B model buys no
+  extra coverage here; `image_14` stays unresolved for both. The model did
+  propose two wrong amounts (a 40.00 USD receipt and a garbled nine-digit INR
+  total), both rejected by the deterministic check, which is why the parser stays
+  the authority — see [`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
 - Live model quality is unmeasured. Replay and offline paths are tested; the
   Kilo/Nemotron and Ollama behavior has not been benchmarked in this repository,
   and there is no published latency or cost comparison yet.
