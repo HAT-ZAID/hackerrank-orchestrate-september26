@@ -1184,7 +1184,7 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument("--request-id", required=True, help="request_id from dataset/requests.csv")
-    parser.add_argument("--provider", default=None, help="replay|ollama|openrouter|none")
+    parser.add_argument("--provider", default=None, help="replay|ollama|openrouter|kilo|none")
     parser.add_argument("--trace-dir", default=None, help="write one JSON trace per request")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="per-turn timeout (s)")
     args = parser.parse_args(argv)

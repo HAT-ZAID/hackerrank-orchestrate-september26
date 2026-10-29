@@ -9,26 +9,31 @@ served by :class:`NullProvider` and :class:`ReplayProvider` and needs no network
 ``ChatProvider`` (Task 5B) is the tool-calling contract used by
 :func:`code.agent.run_agent_loop`: ``name``, ``model``, ``max_calls`` and a lazy
 ``chat_model()`` returning a LangChain chat model.  :class:`OllamaProvider` is the
-local default and :class:`OpenRouterProvider` is the opt-in, hard-capped remote
-one.
+local default, :class:`OpenRouterProvider` is the opt-in, hard-capped remote one,
+and :class:`KiloProvider` is the final deployment path (Kilo's OpenAI-compatible
+endpoint serving Nemotron Ultra).
 
 Everything is lazy and env-driven:
 
 * no SDK import happens at module import time;
-* no model name and no key is hard-coded (except the documented local Ollama
-  default), so the same code runs offline and in the evaluation harness;
+* no model name, URL or key is hard-coded (except the documented local Ollama
+  default and the deployment default model id), so the same code runs offline
+  and in the evaluation harness;
 * a provider that cannot initialize returns ``None`` plus a reason from
   :func:`build_provider`, and the caller falls back to the deterministic kernel.
 
 Environment:
 
-======================  ===============================================
-``BUY_WAIT_LLM_PROVIDER``  ``replay`` | ``ollama`` | ``openrouter`` | ``none``
-``BUY_WAIT_LLM_MODEL``     model id (required for OpenRouter)
-``BUY_WAIT_LLM_MAX_CALLS`` total provider calls per run (default 50)
-``BUY_WAIT_OLLAMA_MODEL``  local model (default ``qwen2.5:1.5b``)
-``BUY_WAIT_OLLAMA_BASE_URL`` default ``localhost:11434`` (scheme ``http``)
-======================  ===============================================
+============================  ===============================================
+``BUY_WAIT_LLM_PROVIDER``     ``replay`` | ``ollama`` | ``openrouter`` | ``kilo`` | ``none``
+``BUY_WAIT_LLM_MODEL``        model id (required for OpenRouter)
+``BUY_WAIT_LLM_MAX_CALLS``    total provider calls per run (default 50)
+``BUY_WAIT_OLLAMA_MODEL``     local model (default ``qwen2.5:1.5b``)
+``BUY_WAIT_OLLAMA_BASE_URL``  default ``localhost:11434`` (scheme ``http``)
+``BUY_WAIT_KILO_BASE_URL``    required: the user's Kilo OpenAI-compatible base URL
+``BUY_WAIT_KILO_API_KEY``     required: the user's Kilo API key
+``BUY_WAIT_KILO_MODEL``       default ``nemotron-3-ultra``
+============================  ===============================================
 """
 from __future__ import annotations
 
@@ -53,7 +58,12 @@ DEFAULT_OLLAMA_MODEL = "qwen2.5:1.5b"
 # a URL is not a filesystem path.
 DEFAULT_OLLAMA_BASE_URL = "http" "://" "localhost:11434"
 OPENROUTER_BASE_URL = "https" "://" "openrouter.ai/api/v1"
-PROVIDER_KINDS = ("replay", "ollama", "openrouter", "none")
+# Kilo is deployed by the user: no real endpoint is stored in the repository.
+KILO_BASE_URL_ENV = "BUY_WAIT_KILO_BASE_URL"
+KILO_API_KEY_ENV = "BUY_WAIT_KILO_API_KEY"
+KILO_MODEL_ENV = "BUY_WAIT_KILO_MODEL"
+DEFAULT_KILO_MODEL = "nemotron-3-ultra"
+PROVIDER_KINDS = ("replay", "ollama", "openrouter", "kilo", "none")
 
 
 class ProviderUnavailable(RuntimeError):
@@ -279,6 +289,62 @@ class OpenRouterProvider(ChatProvider):
             ) from exc
 
 
+class KiloProvider(ChatProvider):
+    """Kilo's OpenAI-compatible endpoint serving Nemotron Ultra.
+
+    This is the final remote deployment path.  Both the base URL and the API key
+    are user-supplied environment variables: no real endpoint or key is ever
+    committed, and the generic OpenRouter key is deliberately *not* a fallback.
+    """
+
+    kind = "kilo"
+    name = "kilo"
+    default_model = DEFAULT_KILO_MODEL
+
+    @classmethod
+    def model_env_name(cls) -> str:
+        return KILO_MODEL_ENV
+
+    def __init__(self, model=None, *, base_url=None, max_calls=None, env=None):
+        super().__init__(model, max_calls=max_calls, env=env)
+        env = self.env
+        # Read once at construction; the key is never stored in a trace or a file.
+        self.base_url = str(base_url or env.get(KILO_BASE_URL_ENV) or "").strip()
+        self._api_key = str(env.get(KILO_API_KEY_ENV) or "").strip()
+        if not self.model:
+            self.model = DEFAULT_KILO_MODEL
+
+    def has_credentials(self) -> bool:
+        return bool(self.base_url and self._api_key)
+
+    def chat_model(self):
+        if not self.base_url:
+            raise ProviderUnavailable(
+                f"{KILO_BASE_URL_ENV} is required for the kilo provider"
+            )
+        if not self._api_key:
+            raise ProviderUnavailable(
+                f"{KILO_API_KEY_ENV} is required for the kilo provider"
+            )
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:
+            raise ProviderUnavailable(
+                f"langchain-openai is not installed: {exc}"
+            ) from exc
+        try:
+            return ChatOpenAI(
+                model=self.model,
+                base_url=self.base_url,
+                api_key=self._api_key,
+                temperature=0,
+            )
+        except Exception as exc:
+            raise ProviderUnavailable(
+                f"cannot create ChatOpenAI model {self.model!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+
 def build_provider(env=None):
     """Return ``(provider, reason)``; ``provider`` is ``None`` when unusable.
 
@@ -305,6 +371,13 @@ def build_provider(env=None):
         if not provider.has_credentials():
             return None, "BUY_WAIT_LLM_API_KEY is required for the openrouter provider"
         return provider, None
+    if kind == "kilo":
+        provider = KiloProvider(env=env)
+        if not provider.base_url:
+            return None, f"{KILO_BASE_URL_ENV} is required for the kilo provider"
+        if not provider.has_credentials():
+            return None, f"{KILO_API_KEY_ENV} is required for the kilo provider"
+        return provider, None
     return None, f"unknown {PROVIDER_ENV} {kind!r}; expected one of {', '.join(PROVIDER_KINDS)}"
 
 
@@ -326,9 +399,14 @@ __all__ = [
     "ChatProvider",
     "DecisionProvider",
     "DEFAULT_FIXTURE_DIR",
+    "DEFAULT_KILO_MODEL",
     "DEFAULT_MAX_CALLS",
     "DEFAULT_OLLAMA_BASE_URL",
     "DEFAULT_OLLAMA_MODEL",
+    "KILO_API_KEY_ENV",
+    "KILO_BASE_URL_ENV",
+    "KILO_MODEL_ENV",
+    "KiloProvider",
     "NullProvider",
     "OllamaProvider",
     "OPENROUTER_BASE_URL",

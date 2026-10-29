@@ -14,7 +14,7 @@ secret the recorder would have redacted.
 Two entry points, both read-only::
 
     python -m tools.trace_view --trace-dir traces/run --out traces/run/index.html
-    python -m tools.trace_view --trace traces/run/request_001.json --out request_001.html
+    python -m tools.trace_view --trace traces/run/request_demo.json --out request_demo.html
 
 ``output.csv`` is never read or written.
 """
@@ -749,8 +749,8 @@ def main(argv=None) -> int:
         epilog=(
             "Examples:\n"
             "  python -m tools.trace_view --trace-dir traces/run --out traces/run/index.html\n"
-            "  python -m tools.trace_view --trace traces/run/request_001.json --out request_001.html\n"
-            "  python -m tools.trace_view --trace traces/run/request_001.json  (HTML to stdout)"
+            "  python -m tools.trace_view --trace traces/run/request_demo.json --out request_demo.html\n"
+            "  python -m tools.trace_view --trace traces/run/request_demo.json  (HTML to stdout)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
