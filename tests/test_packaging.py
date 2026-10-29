@@ -89,11 +89,21 @@ def test_env_example_documents_kilo_and_the_reserved_vlm_names():
 
 
 def test_no_env_file_is_shipped_or_trackable():
-    assert not (REPO_ROOT / ".env").exists(), "a real .env must never be committed"
     import subprocess
 
+    # A local `.env` is expected once someone follows the README; what must never
+    # happen is committing it.  Check the index, not the filesystem, so a
+    # developer's private configuration cannot fail the documented test command.
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", ".env"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert tracked.returncode != 0, ".env must never be committed (a local, untracked one is fine)"
+
     result = subprocess.run(
-        ["git", "check-ignore", ".env", ".env.local"], cwd=REPO_ROOT,
+        # --no-index evaluates the ignore rules independently of the index, so the
+        # check reports the rule rather than the current staging state.
+        ["git", "check-ignore", "--no-index", ".env", ".env.local"], cwd=REPO_ROOT,
         capture_output=True, text=True,
     )
     assert result.returncode == 0, "`.env` must be gitignored"
@@ -105,7 +115,9 @@ def test_env_example_is_the_only_env_file_kept():
     import subprocess
 
     result = subprocess.run(
-        ["git", "check-ignore", "-v", ".env.example"], cwd=REPO_ROOT,
+        # .env.example is tracked, and `git check-ignore` skips tracked paths
+        # unless --no-index is given; we want the rule, not the index state.
+        ["git", "check-ignore", "--no-index", "-v", ".env.example"], cwd=REPO_ROOT,
         capture_output=True, text=True,
     )
     # exit 0 means "a pattern matched"; the winning pattern must be the negation.

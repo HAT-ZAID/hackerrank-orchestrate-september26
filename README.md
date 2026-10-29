@@ -142,9 +142,16 @@ python -m code.agent --request-id <request_id> --provider kilo --trace-dir trace
 BUY_WAIT_LLM_PROVIDER=kilo python -m code.main --agent --agent-limit 5
 ```
 
-If the URL or key is missing, the run reports the missing variable and falls back
-to the deterministic kernel instead of failing or guessing. The 50-call cap is
-shared with the other remote providers.
+If the URL or key is missing the two entry points behave differently, on purpose:
+
+- `python -m code.agent --provider kilo` **exits with an error** naming the missing
+  variable. It is a debug entry point, and a silent fallback there would hide a
+  configuration mistake.
+- `python -m code.main --agent` (and the TUI) **falls back to the deterministic
+  kernel** row for that request and records the reason in the trace, so a batch run
+  never dies halfway.
+
+The 50-call cap is shared with the other remote providers.
 
 ### Docker
 
