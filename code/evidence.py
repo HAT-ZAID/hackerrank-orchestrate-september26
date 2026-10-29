@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 
 from code.ocr import extract_amount_for_event, read_image_text
+from code.vision import VisionEvidence, validate_evidence_amount
 
 
 def _blank_amount(value) -> bool:
@@ -10,6 +11,38 @@ def _blank_amount(value) -> bool:
         return True
     text = str(value).strip().lower()
     return not text or text in {"nan", "none", "nat", "null"}
+
+
+def _read_outcome(read, image_path, event) -> tuple[dict | None, str, str, str | None]:
+    """Turn one reader result into ``(parsed, text, backend, error)``.
+
+    A reader may return plain text (the historical Tesseract contract) or a
+    :class:`~code.vision.VisionEvidence`.  A structured amount is only a *claim*:
+    it is accepted when :func:`~code.vision.validate_evidence_amount` confirms it
+    against the event currency and the deterministic text parser.  Otherwise the
+    text is parsed the usual way, so a hallucinated number can never win.
+    """
+    category = event.get("category")
+    description = event.get("description")
+    currency = event.get("currency")
+    result = read(image_path)
+    if isinstance(result, VisionEvidence) or (
+        hasattr(result, "raw_text") and hasattr(result, "amount") and not isinstance(result, str)
+    ):
+        text = str(getattr(result, "raw_text", "") or "")
+        backend = str(getattr(result, "backend", "") or "unknown")
+        error = getattr(result, "error", None)
+        parsed = validate_evidence_amount(
+            result,
+            expected_currency=currency,
+            category=category,
+            description=description,
+        )
+        if parsed is None and text:
+            parsed = extract_amount_for_event(text, currency, category, description)
+        return parsed, text, backend, error
+    text = str(result or "")
+    return extract_amount_for_event(text, currency, category, description), text, "tesseract", None
 
 
 def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_available=None):
@@ -41,6 +74,8 @@ def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_availab
         candidates = []
         invalid_link = False
         missing_image_ids = []
+        read_attempts = 0
+        read_errors = []
         for image in image_rows:
             image_id = str(image.get("image_id", "") or "").strip()
             image_user = str(image.get("user_id", "") or "").strip()
@@ -58,22 +93,22 @@ def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_availab
                 missing_image_ids.append(image_id)
                 continue
             try:
-                ocr_text = read(image_path)
-                parsed = extract_amount_for_event(
-                    ocr_text,
-                    event.get("currency"),
-                    event.get("category"),
-                    event.get("description"),
-                )
+                read_attempts += 1
+                parsed, ocr_text, backend, error = _read_outcome(read, image_path, event)
             except Exception:
                 ocr_text = ""
                 parsed = None
+                backend = "unknown"
+                error = "reader raised"
+            if parsed is None and error:
+                read_errors.append(error)
             if parsed is not None:
                 candidates.append({
                     "amount": parsed["amount"],
                     "image_id": image_id,
                     "image_path": str(image_path),
                     "ocr_text": ocr_text,
+                    "backend": backend,
                 })
         if invalid_link:
             warnings.append({"event_id": event_id, "flag": "EVIDENCE_LINK_INVALID"})
@@ -89,11 +124,18 @@ def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_availab
             event["amount_source"] = "linked_image_ocr"
             event["amount_evidence_id"] = candidate["image_id"]
             event["amount_evidence_path"] = candidate["image_path"]
+            event["amount_evidence_backend"] = candidate["backend"]
             event["amount_ocr_text"] = candidate["ocr_text"]
         elif len(candidates) > 1 or not candidates or (reader is None and ocr_available is not True):
-            flag = "OCR_UNAVAILABLE" if reader is None and ocr_available is not True else "AMOUNT_UNRESOLVED"
+            no_engine = reader is None and ocr_available is not True
+            # Every attempted read failed outright: that is an engine problem, not
+            # an ambiguous document, so it keeps the honest OCR_UNAVAILABLE flag.
+            all_reads_failed = bool(read_attempts) and len(read_errors) == read_attempts
+            flag = "OCR_UNAVAILABLE" if (no_engine or all_reads_failed) else "AMOUNT_UNRESOLVED"
             warning = {"event_id": event_id, "flag": flag}
             if missing_image_ids and not candidates:
                 warning["image_ids"] = sorted(missing_image_ids)
+            if all_reads_failed and read_errors:
+                warning["errors"] = sorted(set(read_errors))[:3]
             warnings.append(warning)
     return resolved, warnings

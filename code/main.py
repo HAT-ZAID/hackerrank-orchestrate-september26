@@ -18,12 +18,14 @@ if __package__ in (None, ""):
     from code.evidence import resolve_event_amounts
     from code.explanations import generate_explanation
     from code.usage import new_usage, write_usage_report
+    from code.vision import build_backend, read_evidence
 else:
     from code.solver import solve_request
     from code.ocr import configure_tesseract
     from code.evidence import resolve_event_amounts
     from code.explanations import generate_explanation
     from code.usage import new_usage, write_usage_report
+    from code.vision import build_backend, read_evidence
 
 import pandas as pd
 
@@ -216,12 +218,24 @@ def run_pipeline(
     fx = pd.read_csv(root / "dataset/exchange_rates.csv", dtype=str).to_dict("records")
     options = pd.read_csv(root / "dataset/request_payment_options.csv", dtype=str)
     messages = pd.read_csv(root / "dataset/messages.csv", dtype=str)
-    events, evidence_warnings = resolve_event_amounts(
-        images,
-        events,
-        root / "dataset/media/images",
-        ocr_available=ocr_path is not None,
-    )
+    # Image evidence goes through the configured local backend chain
+    # (Qwen3-VL -> Docling -> Tesseract by default).  Failures stay fail-closed in
+    # resolve_event_amounts, and a missing engine is still reported honestly.
+    vision_backend, _vision_reason = build_backend()
+    if vision_backend is None:
+        events, evidence_warnings = resolve_event_amounts(
+            images,
+            events,
+            root / "dataset/media/images",
+            ocr_available=ocr_path is not None,
+        )
+    else:
+        events, evidence_warnings = resolve_event_amounts(
+            images,
+            events,
+            root / "dataset/media/images",
+            reader=lambda image_path: read_evidence(image_path, vision_backend),
+        )
 
     # Optional agent substrate (Task 5A) and bounded agent loop (Task 5B). Both
     # are built only when explicitly asked for, so the default run allocates

@@ -111,6 +111,18 @@ def test_no_env_file_is_shipped_or_trackable():
     assert {".env", ".env.local"} <= ignored
 
 
+def test_local_generated_data_stays_out_of_git():
+    import subprocess
+
+    paths = ["data/cache/ocr/deadbeef.json", "data/app.db", "data/vector_index/x", "traces/run/x.json"]
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", *paths], cwd=REPO_ROOT,
+        capture_output=True, text=True,
+    )
+    ignored = {line.strip() for line in result.stdout.splitlines()}
+    assert ignored == set(paths), f"generated state must be ignored, missing: {sorted(set(paths) - ignored)}"
+
+
 def test_env_example_is_the_only_env_file_kept():
     import subprocess
 

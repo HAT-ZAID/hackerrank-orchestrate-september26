@@ -275,3 +275,100 @@ def test_resolved_amount_preserves_ocr_text_and_raw_path(tmp_path):
     assert resolved[0]["amount"] == "25"
     assert resolved[0]["amount_evidence_path"] == str(image)
     assert resolved[0]["amount_ocr_text"] == ocr_text
+
+
+# ---------------------------------------------------------------------------
+# Structured vision evidence (Qwen3-VL / Docling readers)
+# ---------------------------------------------------------------------------
+
+
+def test_structured_vision_amount_is_used_when_it_agrees_with_the_text(tmp_path):
+    from code.vision import VisionEvidence
+
+    image = tmp_path / "image_01.png"
+    image.write_bytes(b"png")
+    images = pd.DataFrame([{"image_id": "image_01", "related_event_id": "event_01"}])
+    events = [{"event_id": "event_01", "amount": "", "currency": "INR", "category": "salary"}]
+
+    resolved, warnings = resolve_event_amounts(
+        images,
+        events,
+        tmp_path,
+        reader=lambda _: VisionEvidence(
+            backend="vlm",
+            raw_text="Net Pay INR 48,500.00",
+            amount=Decimal("48500.00"),
+            currency="INR",
+        ),
+    )
+
+    assert warnings == []
+    assert resolved[0]["amount"] == "48500.00"
+    assert resolved[0]["amount_source"] == "linked_image_ocr"
+    assert resolved[0]["amount_evidence_backend"] == "vlm"
+
+
+def test_conflicting_vision_amount_falls_back_to_the_parsed_text(tmp_path):
+    from code.vision import VisionEvidence
+
+    (tmp_path / "image_01.png").write_bytes(b"png")
+    images = pd.DataFrame([{"image_id": "image_01", "related_event_id": "event_01"}])
+    events = [{"event_id": "event_01", "amount": "", "currency": "INR", "category": "salary"}]
+
+    resolved, warnings = resolve_event_amounts(
+        images,
+        events,
+        tmp_path,
+        reader=lambda _: VisionEvidence(
+            backend="vlm",
+            raw_text="Net Pay INR 4,850.00",
+            amount=Decimal("48500"),  # the model over-read a digit
+            currency="INR",
+        ),
+    )
+
+    assert warnings == []
+    assert resolved[0]["amount"] == "4850.00"
+    assert resolved[0]["amount_evidence_backend"] == "vlm"
+
+
+def test_vision_amount_in_the_wrong_currency_is_never_applied(tmp_path):
+    from code.vision import VisionEvidence
+
+    (tmp_path / "image_01.png").write_bytes(b"png")
+    images = pd.DataFrame([{"image_id": "image_01", "related_event_id": "event_01"}])
+    events = [{"event_id": "event_01", "amount": "", "currency": "INR"}]
+
+    resolved, warnings = resolve_event_amounts(
+        images,
+        events,
+        tmp_path,
+        reader=lambda _: VisionEvidence(
+            backend="vlm", raw_text="Total USD 100", amount=Decimal("100"), currency="USD"
+        ),
+    )
+
+    assert resolved[0]["amount"] == ""
+    assert warnings == [{"event_id": "event_01", "flag": "AMOUNT_UNRESOLVED"}]
+
+
+def test_every_failed_read_reports_ocr_unavailable_with_the_reason(tmp_path):
+    from code.vision import VisionEvidence
+
+    (tmp_path / "image_01.png").write_bytes(b"png")
+    images = pd.DataFrame([{"image_id": "image_01", "related_event_id": "event_01"}])
+    events = [{"event_id": "event_01", "amount": "", "currency": "INR"}]
+
+    resolved, warnings = resolve_event_amounts(
+        images,
+        events,
+        tmp_path,
+        reader=lambda _: VisionEvidence(backend="auto", error="vlm: connection failed; tesseract: missing"),
+    )
+
+    assert resolved[0]["amount"] == ""
+    assert warnings == [{
+        "event_id": "event_01",
+        "flag": "OCR_UNAVAILABLE",
+        "errors": ["vlm: connection failed; tesseract: missing"],
+    }]

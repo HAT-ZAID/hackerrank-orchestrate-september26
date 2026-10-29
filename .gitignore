@@ -22,4 +22,6 @@ data/*.sqlite-*
 data/index/
 data/vector_index/
 data/ocr_text.json
+# Local OCR/VLM result cache: safe to delete, rebuilt on demand.
+data/cache/
 
