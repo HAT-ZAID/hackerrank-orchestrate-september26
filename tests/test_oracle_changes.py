@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from code.oracle import solve_safe_amount
 
 
@@ -63,6 +65,10 @@ def test_suppressing_flexible_category_raises_safe_amount():
 
 
 def test_suppression_preserves_ledger_shape_and_day_zero():
+    # Monthly accrual (Task 8) posts one prorated monthly budget on the request
+    # date, so day 0 legitimately differs once the category is suppressed.  What
+    # must not change is the ledger shape, and the difference must be exactly the
+    # suppressed monthly budget (100), never a whole re-projection.
     events = _history()
     base = solve_safe_amount("u1", "2026-02-01", "9900", PROFILE, events, [], FLAGS)
     stopped = solve_safe_amount(
@@ -71,7 +77,12 @@ def test_suppression_preserves_ledger_shape_and_day_zero():
     )
     assert len(stopped["ledger"]) == 91
     assert len(base["ledger"]) == 91
-    assert base["ledger"][0] == stopped["ledger"][0]
+    assert base["ledger"][0] == Decimal("9900")
+    assert stopped["ledger"][0] == Decimal("10000")
+    assert stopped["ledger"][0] - base["ledger"][0] == Decimal("100")
+    # Both curves stay inside the user's floor at every point.
+    assert min(base["ledger"]) >= Decimal("1000")
+    assert min(stopped["ledger"]) >= Decimal("1000")
 
 
 def test_no_suppression_matches_default_behavior():

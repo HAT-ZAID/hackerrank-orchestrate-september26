@@ -69,7 +69,12 @@ def test_single_history_does_not_forecast():
 
 
 def test_forecast_average_excludes_failed_and_pending_credit():
-    # 3x settled 1000 + failed 10000 + pending-credit 10000 => avg must stay 1000.
+    # 3x settled 1000 + failed 10000 + pending-credit 10000.  Monthly accrual
+    # totals settled spend per month: Nov = 1000, Dec = 2000, so the median
+    # monthly budget is 1500 and day 0 is 5000 - 1500 = 3500.  Counting the failed
+    # and pending-credit rows would make Dec = 22000 and the median 11500, which
+    # would drive day 0 negative; counting only one December row would give 1000
+    # and day 0 = 4000, so 3500 identifies the exact policy.
     profile = {"home_currency": "USD", "current_available_balance": "5000",
                "minimum_balance_to_keep": "0",
                "expense_categories_to_protect": "rent"}
@@ -82,5 +87,5 @@ def test_forecast_average_excludes_failed_and_pending_credit():
     ]
     flags = {("u1", "rent", "expense")}
     res = solve_safe_amount("u1", "2026-01-02", "5000", profile, evs, [], flags)
-    # first forecast ~2026-01-30 (day 28): 5000-1000=4000 if avg 1000; polluted avg would be far lower
-    assert res["ledger"][28] == Decimal("4000")
+    assert res["ledger"][0] == Decimal("3500")
+    assert res["ledger"][28] == Decimal("3500")

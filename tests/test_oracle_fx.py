@@ -30,8 +30,10 @@ def _fx_hist(date, amount, currency, eid, direction="debit", status="settled"):
 
 
 def test_foreign_history_converted_to_home_currency():
-    # Two EUR 100 expenses with exact 2.0 EUR->USD rate must forecast -200 USD,
-    # not raw -100. Interval 30d: 2025-11-01,2025-12-01 -> first forecast 2026-01-30 (day 28).
+    # Two EUR 100 expenses with an exact 2.0 EUR->USD rate form a monthly budget
+    # of 200 home-currency units; an unconverted budget would be 100, so the
+    # ledger proves the conversion.  Monthly accrual (Task 8) posts the budget on
+    # the request date, and again one bucket later (2026-02-02, day 31).
     profile = {"home_currency": "USD", "current_available_balance": "5000",
                "minimum_balance_to_keep": "0", "expense_categories_to_protect": "rent"}
     evs = [_fx_hist("2025-11-01", "100", "EUR", "fh1"),
@@ -40,18 +42,24 @@ def test_foreign_history_converted_to_home_currency():
           {"rate_date": "2025-12-01", "from_currency": "EUR", "to_currency": "USD", "rate": "2.0"}]
     flags = {("u1", "rent", "expense")}
     res = solve_safe_amount("u1", "2026-01-02", "5000", profile, evs, fx, flags)
-    assert res["ledger"][0] == Decimal("5000")
-    assert res["ledger"][28] == Decimal("4800")
+    assert res["ledger"][0] == Decimal("4800")
+    assert res["ledger"][28] == Decimal("4800")   # no second bucket yet
+    assert res["ledger"][31] == Decimal("4600")   # 2026-02-02, next monthly budget
 
 
 def test_missing_rate_history_skipped():
-    # EUR 100 @2.0 (=200 home) + XYZ 1000 with no rate: missing observation is skipped,
-    # so average stays -200 and forecast is 4800 (not polluted 4450, not raw 4900).
+    # EUR 100 @2.0 (=200 home) in two months plus an XYZ row with no rate: the
+    # unconvertible observation is skipped, so the monthly budget stays 200 and
+    # day 0 is 4800.  Counting the XYZ row at face value (1000) would push the
+    # December total to 1200 and the median budget to 700 (day 0 = 4300).
     profile = {"home_currency": "USD", "current_available_balance": "5000",
                "minimum_balance_to_keep": "0", "expense_categories_to_protect": "rent"}
     evs = [_fx_hist("2025-11-01", "100", "EUR", "fh1"),
-           _fx_hist("2025-12-01", "1000", "XYZ", "fh2")]
-    fx = [{"rate_date": "2025-11-01", "from_currency": "EUR", "to_currency": "USD", "rate": "2.0"}]
+           _fx_hist("2025-12-01", "100", "EUR", "fh2"),
+           _fx_hist("2025-12-15", "1000", "XYZ", "fh3")]
+    fx = [{"rate_date": "2025-11-01", "from_currency": "EUR", "to_currency": "USD", "rate": "2.0"},
+          {"rate_date": "2025-12-01", "from_currency": "EUR", "to_currency": "USD", "rate": "2.0"}]
     flags = {("u1", "rent", "expense")}
     res = solve_safe_amount("u1", "2026-01-02", "5000", profile, evs, fx, flags)
+    assert res["ledger"][0] == Decimal("4800")
     assert res["ledger"][28] == Decimal("4800")
