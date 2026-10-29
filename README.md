@@ -62,6 +62,26 @@ canonical structured store and fallback retriever, a static HTML trace viewer fo
 every agent run, and a TUI for exploring, simulating and re-deciding requests
 without touching your files.
 
+### Reading images locally
+
+Screenshots (payslips, receipts, bills, transfer confirmations) are read on your
+machine, never in the cloud.
+
+| Backend | What it does | Configure with |
+|---|---|---|
+| `vlm` | Qwen3-VL 2B Instruct through a local Ollama endpoint: text plus a structured amount, currency, date and merchant | `BUY_WAIT_VLM_BASE_URL`, `BUY_WAIT_VLM_MODEL` |
+| `docling` | IBM Docling layout-aware markdown, run in its own interpreter | `BUY_WAIT_DOCLING_PYTHON` |
+| `tesseract` | Classic OCR, kept as the comparison and last-resort path | `TESSERACT_CMD` |
+
+`BUY_WAIT_OCR_BACKEND=auto` tries Qwen3-VL, then Docling when configured, then
+Tesseract. A model-proposed amount is trusted only when it is positive, in the
+event's currency, and agrees with the deterministic parser reading the same text;
+otherwise the parser's own reading wins and the disagreement is recorded. A
+non-loopback VLM host is refused unless you set `BUY_WAIT_VLM_ALLOW_REMOTE=1`.
+Reads are cached on disk by image content and backend, and expired entries are
+dropped, so repeat runs do no model work. Comparison results live in
+[`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
+
 See [`docs/architecture.md`](./docs/architecture.md) for the module map and data
 flow, and [`docs/edge-case-policy.md`](./docs/edge-case-policy.md) for the
 governed edge cases.
@@ -76,9 +96,11 @@ Requires Python 3.11+.
 python -m pip install -r requirements.txt
 ```
 
-`pandas` and `rich` are all the deterministic path and the TUI need. The OCR
-stack (`pytesseract`, `Pillow`) is optional and additionally needs a Tesseract
-binary at runtime; set `TESSERACT_CMD` if it is not on `PATH`.
+`pandas` and `rich` are all the deterministic path and the TUI need. Image
+reading (`pytesseract`, `Pillow`) is optional and additionally needs a Tesseract
+binary at runtime; set `TESSERACT_CMD` if it is not on `PATH`. The local vision
+path needs a running Ollama server serving `qwen3-vl:2b-instruct-q4_K_M` (or a
+Docling interpreter); neither needs an API key.
 
 ### 2. Run the deterministic batch
 
@@ -196,10 +218,11 @@ unproven and report anything it breaks.
   run passed the structural and safety gates (G0/G1/G3/G4) but failed the sample
   quality gate (G2), with `recommended_payment_method`, `payment_plan`,
   `earliest_date_for_full_payment` and spending-change rows the main gaps.
-- Image evidence is read with Tesseract OCR only. A local vision model for
-  image reading (Qwen3-VL via Ollama/Docling) is **not implemented yet** — the
-  `BUY_WAIT_VLM_*` variables in `.env.example` are reserved for that work and are
-  currently ignored.
+- Image reading is local but uneven. On the 16 linked images Tesseract and
+  Qwen3-VL 2B both resolve 15; `image_14` stays unresolved. The 2B model returns
+  unusable answers on some layouts, so the deterministic parser stays the
+  authority and the model is only a reader — see
+  [`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
 - Live model quality is unmeasured. Replay and offline paths are tested; the
   Kilo/Nemotron and Ollama behavior has not been benchmarked in this repository,
   and there is no published latency or cost comparison yet.

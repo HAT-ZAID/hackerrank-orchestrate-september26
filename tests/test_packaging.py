@@ -26,17 +26,29 @@ KILO_ENV_NAMES = ("BUY_WAIT_KILO_BASE_URL", "BUY_WAIT_KILO_API_KEY", "BUY_WAIT_K
 KILO_DEFAULT_MODEL = "nemotron-3-ultra"
 
 # Literal values allowed in `.env.example`; anything else must be `<...>`.
+# Every entry here is a public, non-secret default that ships in the code anyway:
+# a loopback URL, an enum, a timeout, a path under the repo, or an official model
+# tag.  A real key or a remote endpoint stays a placeholder.
 SAFE_ENV_VALUES = {
     "",
     "none",
     "ollama",
     "openrouter",
     "kilo",
+    "auto",
     "50",
     "120",
+    "180",
+    "300",
+    "30",
+    "0",
+    "1",
+    "data/cache",
     "qwen2.5:1.5b",
+    "qwen3-vl:2b-instruct-q4_K_M",
     KILO_DEFAULT_MODEL,
     "http://localhost:11434",
+    "http://127.0.0.1:11434",
 }
 
 ENV_ASSIGNMENT = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]*)=(.*)$", re.MULTILINE)
@@ -78,13 +90,25 @@ def test_env_example_exists_with_placeholders_only():
     assert unsafe == {}, f"non-placeholder values in .env.example: {unsafe}"
 
 
-def test_env_example_documents_kilo_and_the_reserved_vlm_names():
+def test_env_example_documents_kilo_and_the_local_vision_names():
     text = _text(".env.example")
     for name in KILO_ENV_NAMES:
         assert f"{name}=" in text, f"{name} missing from .env.example"
     assert KILO_DEFAULT_MODEL in text
-    # Reserved for Task 9; documented so users are not surprised later.
-    for name in ("BUY_WAIT_VLM_BASE_URL", "BUY_WAIT_VLM_MODEL", "BUY_WAIT_VLM_TIMEOUT"):
+    # The local vision path and its cache are real code now, so their knobs must
+    # be discoverable from the template rather than only from the source.
+    for name in (
+        "BUY_WAIT_OCR_BACKEND",
+        "BUY_WAIT_VLM_BASE_URL",
+        "BUY_WAIT_VLM_MODEL",
+        "BUY_WAIT_VLM_TIMEOUT",
+        "BUY_WAIT_VLM_ALLOW_REMOTE",
+        "BUY_WAIT_DOCLING_PYTHON",
+        "BUY_WAIT_DOCLING_TIMEOUT",
+        "BUY_WAIT_CACHE_DIR",
+        "BUY_WAIT_CACHE_TTL_DAYS",
+        "BUY_WAIT_CACHE_DISABLE",
+    ):
         assert f"{name}=" in text, f"{name} missing from .env.example"
 
 
@@ -209,10 +233,14 @@ def test_readme_documents_offline_default_and_kilo_deployment():
     assert "you must" in text, "README must say the user configures Kilo"
 
 
-def test_readme_does_not_claim_the_unbuilt_vision_ocr_path():
+def test_readme_documents_the_local_image_readers_honestly():
     text = _text("README.md").lower()
-    assert "not implemented" in text, "README must flag the reserved VLM path as unimplemented"
-    assert "tesseract" in text, "README must describe the OCR path that actually exists"
+    # The local vision path exists; the README must describe it *and* keep the
+    # Tesseract fallback and the remaining accuracy limit in view.
+    for phrase in ("qwen3-vl", "docling", "tesseract", "buy_wait_ocr_backend"):
+        assert phrase in text, f"README missing {phrase!r} in the image-reading section"
+    assert "resolve 15" in text or "15/16" in text, "README must state the measured OCR coverage"
+    assert "unresolved" in text, "README must not imply every image resolves"
 
 
 def test_default_remains_offline_and_keyless():
