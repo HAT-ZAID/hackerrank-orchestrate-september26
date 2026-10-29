@@ -21,3 +21,30 @@
 **Resolved an amount:** tesseract 15/16, vlm 15/16
 **Exact agreement:** 14/15
 **Cache:** hits 3, misses 29, writes 28
+
+## What the two readers cannot do
+
+**`image_14` is handwriting.** It is a carbon-copy pharmacy invoice whose items and
+total are written by hand. A person reads the line items as 1500, 724, 796, 550, 303
+and 670, with `TOTAL 4543.00` written beside them. Neither Tesseract (a printed-text
+engine) nor Qwen3-VL 2B (a small vision model trained mostly on printed documents)
+returns a usable amount, so `event_9421` stays unresolved.
+
+That single unreadable receipt is not a cosmetic gap. The forecaster fails closed on an
+unknown amount, so `request_101` (the request that depends on this event) returns
+`amount_safe_to_pay = 0`, `not_affordable`, with the explanation "financial evidence
+for event_9421 remains unresolved". One handwritten receipt decides a whole request.
+
+The honest options are: use a stronger local vision model, add a human confirmation
+step in the TUI for unresolved images, or accept the conservative answer. Guessing
+4543.00 from a model that cannot read handwriting is exactly the failure mode the
+validator exists to prevent.
+
+**`image_15` shows the validator doing its job.** The VLM answered `1142513200` for an
+INR 9968 receipt, roughly 114,000x too large. The structured amount disagreed with the
+text parse, was rejected, and the deterministic parser's `9968.00` was used. A system
+that trusted the model's JSON would have recorded a 1.14 billion rupee pharmacy bill.
+
+**Formatting is not disagreement.** `100000.00` and `100000`, or `41272.00` and
+`41272.0`, are the same money. The comparison tool originally compared strings and
+counted five false disagreements; it now compares `Decimal` values.
