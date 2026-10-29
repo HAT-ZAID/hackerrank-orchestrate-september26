@@ -149,8 +149,16 @@ def compare(root: Path, image_dir: Path, backends, limit=None, use_cache=True) -
                 "cached": evidence.cached,
             }
         decided = [r["amount"] for r in row["results"].values() if r["amount"] not in {"error", "—"}]
+        # Agreement is numeric, not textual: ``723`` and ``723.00`` are the same
+        # money, and readers differ only in how they print it.
+        values = set()
+        for amount in decided:
+            try:
+                values.add(Decimal(str(amount)))
+            except Exception:
+                values.add(str(amount))
         # Agreement is only meaningful when at least two readers produced a number.
-        row["agree"] = None if len(decided) < 2 else len(set(decided)) == 1
+        row["agree"] = None if len(decided) < 2 else len(values) == 1
         rows.append(row)
 
     return {"rows": rows, "cache": cache.stats(), "backends": list(backends)}
@@ -225,6 +233,7 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="only the first N linked images")
     parser.add_argument("--no-cache", action="store_true", help="ignore and do not write the OCR cache")
     parser.add_argument("--out", default=None, help="write the Markdown report here")
+    parser.add_argument("--json", default=None, help="also write the raw per-image result as JSON")
     args = parser.parse_args(argv)
 
     root = Path(args.repo_root).resolve()
@@ -246,6 +255,17 @@ def main(argv=None) -> int:
             out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(text, encoding="utf-8", newline="\n")
         print(f"wrote {out_path}")
+    if args.json:
+        import json
+
+        json_path = Path(args.json)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+            newline="\n",
+        )
+        print(f"wrote {json_path}")
     return 0
 
 

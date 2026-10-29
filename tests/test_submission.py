@@ -154,9 +154,15 @@ def test_no_hardcoded_labels_in_code():
 def test_paths_built_from_repo_root_not_hardcoded():
     """No hardcoded absolute paths (either slash style, UNC, /tmp) or home-dir joins."""
     bad = []
+    # ``(?<![A-Za-z])`` keeps the drive-letter rule from matching a URL scheme:
+    # ``http://127.0.0.1:11434`` is documentation, ``C:\\data`` is a real path.
+    pattern = (
+        r"(?<![A-Za-z])[A-Za-z]:[\\/]|\\\\\\\\|/home/|/Users/|/tmp/"
+        r"|Path\.home\(\)|os\.path\.expanduser"
+    )
     for path in (REPO_ROOT / "code").rglob("*.py"):
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if re.search(r"[A-Za-z]:[\\/]|\\\\\\\\|/home/|/Users/|/tmp/|Path\.home\(\)|os\.path\.expanduser", text):
+        if re.search(pattern, text):
             bad.append(path.name)
     assert bad == [], f"hardcoded absolute paths: {bad}"
 
