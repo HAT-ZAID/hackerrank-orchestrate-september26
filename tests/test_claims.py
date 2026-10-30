@@ -160,3 +160,35 @@ def test_a_rationale_may_cite_the_request_amount_it_was_given():
     )
     # 20,500 was never supplied, so it stays rejected even with the extras.
     assert report["ok"] is False
+
+
+def test_request_facts_use_the_keyword_only_tool_api():
+    """A positional call would raise inside the loop and silently widen nothing."""
+
+    class KeywordOnly:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, name, **kwargs):
+            self.calls.append((name, kwargs))
+            if not kwargs.get("request_id"):
+                raise TypeError("request_id is keyword only")
+            return {"ok": True, "data": {"request": {"requested_amount": "6670"}}}
+
+    from code.agent import _request_facts
+
+    tools = KeywordOnly()
+    facts = _request_facts(tools, "request_demo")
+    assert tools.calls == [("get_request_context", {"request_id": "request_demo"})]
+    assert facts["request"]["requested_amount"] == "6670"
+
+
+def test_request_facts_are_empty_when_the_read_fails():
+    from code.agent import _request_facts
+
+    class Broken:
+        def call(self, name, **kwargs):
+            raise RuntimeError("store unavailable")
+
+    assert _request_facts(Broken(), "request_demo") == {}
+    assert _request_facts(object(), "request_demo") == {}

@@ -62,11 +62,24 @@ Two layers, with a hard boundary between them:
    forecasts 90 days of daily balances, and searches full / partial / installment
    / wait plans. It owns every number: safe amounts, earliest dates, plan
    feasibility, spending-change search and plan ranking.
-2. **An optional agentic analyst** can call seven typed tools (request context,
-   evidence search, events, projection, payment options, spending-change
-   candidates, `propose_decision`). Its proposal is checked by a deterministic
-   verifier against the kernel; anything that disagrees, or any provider error,
-   falls back to the kernel row. The agent cannot edit a decision field.
+2. **An optional agentic analyst** runs a bounded tool-calling loop over twelve
+   typed tools: it reads the request context, searches evidence, projects cash
+   flow, compares payment options, reconciles receipts and submits a proposal.
+   A deterministic verifier recomputes the kernel row and keeps its own numbers.
+   The agent owns three things and nothing else:
+   - the **explanation**, shipped only when every amount, date, status and action
+     in it is reproduced by the kernel row (`code/claims.py`);
+   - a **guarded spending change**, shipped only when the re-solved plan raises
+     the safe amount and the event is permitted and unprotected;
+   - **concerns** about unreadable or conflicting evidence, which change no number.
+
+   Schema errors and ledger disagreements are fed back to the model with the exact
+   fix and retried up to `BUY_WAIT_AGENT_REPAIR_TURNS` (default 2). When that is
+   exhausted, or on any provider error, the kernel row stands.
+
+   It can also take plain instructions in the TUI — `ask stop my streaming
+   subscription`, `ask can I afford 40,000 on the 12th`, `ask undo` — through the
+   same kernel, session-only.
 
 Supporting pieces: RAG retrieval over messages/OCR text with SQLite (FTS5) as the
 canonical structured store and fallback retriever, a static HTML trace viewer for

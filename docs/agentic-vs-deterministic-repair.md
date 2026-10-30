@@ -6,22 +6,22 @@ Requests compared: **3** (first 3 in dataset order)
 ## Guardrail
 
 - Machine fields identical: **3/3**
-- Verifier rewrote the explanation from the model's rationale: **1/3**
+- Verifier rewrote the explanation from the model's rationale: **2/3**
 - Agent fallbacks: **0/3**
 
 ## Cost
 
-- Model calls: **18** (6.0 per request)
-- Tool calls: **18** (6.0 per request)
-- Wall clock per request: mean **128.21s**, max **148.80s**
+- Model calls: **22** (7.3 per request)
+- Tool calls: **22** (7.3 per request)
+- Wall clock per request: mean **176.31s**, max **245.74s**
 
 ## Per request
 
 | request | machine fields | explanation | rationale | fallback | model calls | tool calls | seconds |
 |---|---|---|---|---|---|---|---|
-| request_26 | identical | rewritten | candidate | — | 6 | 6 | 112.625 |
-| request_27 | identical | kernel text | kernel | — | 5 | 5 | 123.203 |
-| request_28 | identical | kernel text | kernel | — | 7 | 7 | 148.797 |
+| request_26 | identical | kernel text | kernel | — | 8 | 8 | 193.391 |
+| request_27 | identical | rewritten | candidate | — | 5 | 5 | 89.797 |
+| request_28 | identical | rewritten | candidate | — | 9 | 9 | 245.735 |
 
 ## Reading this
 

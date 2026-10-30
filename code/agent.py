@@ -809,13 +809,7 @@ def run_agent_loop(
     kernel_result = _kernel_for(tools, request_id)
     # The facts the model is shown: used to route the first turn and to let the
     # claim check accept a rationale that cites them.
-    facts: dict = {}
-    try:
-        fetched = tools.call("get_request_context", request_id)
-        if isinstance(fetched, dict) and fetched.get("ok"):
-            facts = dict(fetched.get("data") or {})
-    except Exception:  # a failed read only narrows what prose may cite
-        facts = {}
+    facts = _request_facts(tools, request_id)
     if retriever is not None and getattr(tools, "retriever", None) is None:
         tools.retriever = retriever
 
@@ -1286,6 +1280,22 @@ def _repair_message(rejection: dict) -> str:
         + str(rejection.get("detail") or "unknown reason")
         + "). Re-read the tool output and resubmit all ten fields."
     )
+
+
+def _request_facts(tools, request_id: str) -> dict:
+    """Fetch the request facts the model is shown.
+
+    `Toolbox.call` takes the arguments by keyword only, so a positional call
+    raises inside the loop and silently narrows what a rationale may cite. This
+    wrapper keeps that failure quiet in production and testable in isolation.
+    """
+    try:
+        fetched = tools.call("get_request_context", request_id=request_id)
+    except Exception:  # a failed read only narrows what prose may cite
+        return {}
+    if isinstance(fetched, dict) and fetched.get("ok"):
+        return dict(fetched.get("data") or {})
+    return {}
 
 
 def _context_facts(context: dict, payload=None) -> tuple[tuple, tuple]:
