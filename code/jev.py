@@ -49,7 +49,20 @@ JEV_MODEL_ENV = "BUY_WAIT_JEV_MODEL"
 JEV_TIMEOUT_ENV = "BUY_WAIT_JEV_TIMEOUT"
 OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY"
 AUTH_JSON_PATH_ENV = "OPENCODE_AUTH_JSON"
-DEFAULT_AUTH_JSON = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+def _default_auth_json() -> Path:
+    """The OpenCode CLI's own auth.json location, derived from the environment.
+
+    The CLI stores credentials under the user data home. ``XDG_DATA_HOME`` can
+    move it the standard way; otherwise the platform user profile root is used.
+    Deriving from the environment keeps the code free of machine-specific paths.
+    """
+    data_home = os.environ.get("XDG_DATA_HOME") or Path(
+        os.environ.get("USERPROFILE") or os.environ.get("HOME", ".")
+    ) / ".local" / "share"
+    return Path(data_home) / "opencode" / "auth.json"
+
+
+DEFAULT_AUTH_JSON = _default_auth_json()
 DEFAULT_MODEL = "jev-1.13-free"
 DEFAULT_TIMEOUT = 60.0
 #: The decision endpoint requires a normal client User-Agent; its edge
