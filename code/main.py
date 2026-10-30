@@ -19,6 +19,7 @@ if __package__ in (None, ""):
     from code.explanations import generate_explanation
     from code.usage import new_usage, write_usage_report
     from code.vision import build_backend, read_evidence
+    from code.cache import default_cache
 else:
     from code.solver import solve_request
     from code.ocr import configure_tesseract
@@ -26,6 +27,7 @@ else:
     from code.explanations import generate_explanation
     from code.usage import new_usage, write_usage_report
     from code.vision import build_backend, read_evidence
+    from code.cache import default_cache
 
 import pandas as pd
 
@@ -204,6 +206,9 @@ def run_pipeline(
     """
     root = Path(repo_root).resolve() if repo_root is not None else REPO_ROOT
     ocr_path = configure_runtime()
+    # Expired cache entries are dropped before any read, so a long-lived checkout
+    # cannot keep serving month-old OCR results from keys nobody touches again.
+    default_cache().purge_expired()
 
     # Load data (repo-root anchored so any CWD works; no CLI change)
     if requests_path is None:

@@ -5,10 +5,12 @@ import json
 
 from code.cache import (
     DECISIONS_NAMESPACE,
+    DEFAULT_CACHE_DIR,
     OCR_NAMESPACE,
     DiskCache,
     cache_key,
     canonical_json,
+    main as cache_cli,
 )
 
 
@@ -163,3 +165,35 @@ def test_writes_are_atomic_and_leave_no_temp_files(tmp_path):
 def test_canonical_json_is_order_insensitive():
     assert canonical_json({"b": 1, "a": 2}) == canonical_json({"a": 2, "b": 1})
     assert canonical_json({"a": 2}) != canonical_json({"a": 3})
+
+
+def test_cli_purge_removes_expired_entries(tmp_path, capsys):
+    clock = Clock()
+    cache = _cache(tmp_path, clock=clock)
+    cache.put(OCR_NAMESPACE, {"image": "images/old.png"}, {"amount": "1"})
+    clock.advance(31 * 86400)
+
+    code = cache_cli(["--root", str(tmp_path / "cache"), "--purge", "--stats"])
+
+    assert code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["purged"] == 1
+    assert printed["stats"]["enabled"] is True
+    assert not any((tmp_path / "cache").glob("**/*.json"))
+
+
+def test_cli_reports_entries_without_purging(tmp_path, capsys):
+    cache = _cache(tmp_path)
+    cache.put(OCR_NAMESPACE, {"image": "images/one.png"}, {"amount": "1"})
+
+    cache_cli(["--root", str(tmp_path / "cache")])
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["entries"] == 1
+    assert "purged" not in printed
+
+
+def test_default_cache_root_is_repo_anchored():
+    # One checkout, one cache: the default must not depend on the working directory.
+    assert DEFAULT_CACHE_DIR.is_absolute()
+    assert DEFAULT_CACHE_DIR.parts[-2:] == ("data", "cache")

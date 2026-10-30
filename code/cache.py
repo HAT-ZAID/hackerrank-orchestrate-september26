@@ -42,7 +42,10 @@ CACHE_DIR_ENV = "BUY_WAIT_CACHE_DIR"
 CACHE_DISABLE_ENV = "BUY_WAIT_CACHE_DISABLE"
 CACHE_TTL_ENV = "BUY_WAIT_CACHE_TTL_DAYS"
 
-DEFAULT_CACHE_DIR = Path("data") / "cache"
+#: Repository root anchors the default cache so one checkout owns one cache no
+#: matter which directory the command is run from.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
 DEFAULT_TTL_DAYS = 30.0
 KEY_VERSION = 1
 
@@ -223,6 +226,44 @@ def default_cache(**kwargs) -> DiskCache:
     return DiskCache(**kwargs)
 
 
+def main(argv=None) -> int:
+    """``python -m code.cache``: inspect or sweep the local cache.
+
+    Sweeping is how expired entries leave the disk when nobody reads them again;
+    reads already treat an expired entry as a miss and delete it.
+    """
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="python -m code.cache",
+        description="Inspect or sweep the local OCR/VLM cache.",
+    )
+    parser.add_argument("--root", default=None, help="cache directory (default: BUY_WAIT_CACHE_DIR or data/cache)")
+    parser.add_argument("--ttl-days", type=float, default=None, help="entry lifetime in days")
+    parser.add_argument("--namespace", default=None, help="limit --purge to one namespace")
+    parser.add_argument("--purge", action="store_true", help="delete expired entries")
+    parser.add_argument("--stats", action="store_true", help="print cache settings and counters")
+    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+
+    cache = DiskCache(args.root, ttl_days=args.ttl_days)
+    report = {"root": str(cache.root), "enabled": cache.enabled, "ttl_days": round(cache.ttl_seconds / 86400.0, 3)}
+    if not cache.enabled:
+        report["note"] = f"{CACHE_DISABLE_ENV} disables the cache; nothing to sweep"
+    elif args.purge:
+        report["purged"] = cache.purge_expired(args.namespace)
+    else:
+        report["entries"] = sum(1 for _ in cache.root.glob("**/*.json")) if cache.root.exists() else 0
+    if args.stats:
+        report["stats"] = cache.stats()
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())
+
+
 __all__ = [
     "CACHE_DIR_ENV",
     "CACHE_DISABLE_ENV",
@@ -234,7 +275,9 @@ __all__ = [
     "KEY_VERSION",
     "OCR_NAMESPACE",
     "RAG_NAMESPACE",
+    "REPO_ROOT",
     "cache_key",
     "canonical_json",
     "default_cache",
+    "main",
 ]

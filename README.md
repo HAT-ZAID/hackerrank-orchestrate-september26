@@ -78,9 +78,16 @@ Tesseract. A model-proposed amount is trusted only when it is positive, in the
 event's currency, and agrees with the deterministic parser reading the same text;
 otherwise the parser's own reading wins and the disagreement is recorded. A
 non-loopback VLM host is refused unless you set `BUY_WAIT_VLM_ALLOW_REMOTE=1`.
-Reads are cached on disk by image content and backend, and expired entries are
-dropped, so repeat runs do no model work. Comparison results live in
-[`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
+Reads are cached on disk by image path, image bytes and backend, so repeat runs do
+no model work; entries older than `BUY_WAIT_CACHE_TTL_DAYS` (default 30) are treated
+as misses and swept from disk. Inspect or clean the cache with:
+
+```bash
+python -m code.cache --stats            # root, TTL, entry count
+python -m code.cache --purge --stats    # delete expired entries now
+```
+
+Comparison results live in [`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
 
 See [`docs/architecture.md`](./docs/architecture.md) for the module map and data
 flow, and [`docs/edge-case-policy.md`](./docs/edge-case-policy.md) for the
