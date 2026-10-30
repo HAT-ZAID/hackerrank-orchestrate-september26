@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import pytest
 
-from code.agent import CANDIDATE_FIELDS, CANDIDATE_SCHEMA, TOOL_SCHEMAS
+from code.agent import (
+    CANDIDATE_FIELDS,
+    CANDIDATE_SCHEMA,
+    PROMPT_VERSION,
+    TOOL_SCHEMAS,
+    prompt_hash,
+)
 from code.providers import (
     DEFAULT_NUM_CTX,
     OLLAMA_NUM_CTX_ENV,
@@ -109,3 +115,23 @@ def test_bad_generation_settings_fall_back_instead_of_raising(key: str, value: s
 def test_context_window_is_never_degenerate() -> None:
     options = OllamaProvider("gemma4:e2b-it-qat", env={OLLAMA_NUM_CTX_ENV: "16"}).generation_options()
     assert options["num_ctx"] >= 512
+
+
+def test_prompt_version_names_the_flat_proposal_contract() -> None:
+    assert PROMPT_VERSION == "agent-loop-v2"
+
+
+def test_prompt_hash_tracks_the_contract_not_just_the_label(monkeypatch) -> None:
+    baseline = prompt_hash()
+    assert baseline == prompt_hash(), "the digest must be stable across calls"
+
+    monkeypatch.setattr("code.agent.CANDIDATE_FIELDS", tuple(CANDIDATE_FIELDS)[:-1])
+    assert prompt_hash() != baseline, "dropping a contract field must change the hash"
+    monkeypatch.undo()
+
+    monkeypatch.setattr("code.agent.CANDIDATE_SCHEMA", {})
+    assert prompt_hash() != baseline, "changing the schema must change the hash"
+    monkeypatch.undo()
+
+    assert prompt_hash() == baseline
+

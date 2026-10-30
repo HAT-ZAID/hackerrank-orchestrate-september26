@@ -306,12 +306,13 @@ The first run on it was better and still useless:
 | Model calls (total / per request) | 14 / 4.7 |
 | Wall clock (mean / max) | 92.2 s / 103.7 s |
 
-Every fallback named the same shape failure: `propose_decision` was missing
-`amount_safe_to_pay`, `confidence`, `rationale`, `request_id`, and carried an
-unexpected `spending_changes`. Isolated probes of the same model produced
-perfectly valid vision JSON and a valid tool call with complete arguments, so the
-model was not simply incompetent. That contradiction was worth chasing instead of
-adding more timeout.
+Two of the three fallbacks named the same shape failure: `propose_decision` was
+missing `amount_safe_to_pay`, `confidence`, `rationale`, `request_id`, and carried
+an unexpected `spending_changes`. The third (`request_28`) failed differently: it
+returned neither a tool call nor valid JSON, so it never reached the validator at
+all. Isolated probes of the same model produced perfectly valid vision JSON and a
+valid tool call with complete arguments, so the model was not simply incompetent.
+That contradiction was worth chasing instead of adding more timeout.
 
 **What was actually wrong.** The tool definition asked the model to fill one
 nested object: `propose_decision({"candidate": {…ten fields…}})`. Capturing the raw

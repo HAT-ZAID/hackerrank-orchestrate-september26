@@ -48,7 +48,10 @@ from code.schema import (
 )
 from code.verifier import enforce_decision
 
-PROMPT_VERSION = "agent-loop-v1"
+#: Bumped whenever the proposal contract changes shape.  ``agent-loop-v2`` is
+#: the flat proposal: the ten candidate fields are top-level tool arguments
+#: instead of a single wrapped ``candidate`` object.
+PROMPT_VERSION = "agent-loop-v2"
 SUBSTRATE_PROMPT_VERSION = "agent-substrate-v1"
 
 MAX_TOOL_CALLS = 6
@@ -333,9 +336,29 @@ class AgentResult:
 # ---------------------------------------------------------------------------
 
 
+def _contract_payload(version: str) -> dict:
+    """Everything that decides what the model is asked to produce."""
+    return {
+        "version": version,
+        "system_prompt": SYSTEM_PROMPT,
+        "candidate_fields": list(CANDIDATE_FIELDS),
+        "candidate_schema": CANDIDATE_SCHEMA,
+        "tools": agent_tool_schemas(),
+    }
+
+
 def prompt_hash(version: str = PROMPT_VERSION) -> str:
-    """Short stable digest of the prompt/contract version used in traces."""
-    return hashlib.sha256(str(version).encode("utf-8")).hexdigest()[:16]
+    """Short stable digest of the prompt/contract used in traces.
+
+    Hashing the version label alone let two different contracts share one hash:
+    the wrapped ``candidate`` schema and the flat one both reported
+    ``agent-loop-v1``.  The digest now covers the system prompt, the candidate
+    field list, the candidate schema and the bound tool schemas, so a trace
+    recorded against a different contract is visibly different.
+    """
+    payload = _contract_payload(version)
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def agent_tool_schemas(names=None) -> list[dict]:
