@@ -372,3 +372,70 @@ def test_every_failed_read_reports_ocr_unavailable_with_the_reason(tmp_path):
         "flag": "OCR_UNAVAILABLE",
         "errors": ["vlm: connection failed; tesseract: missing"],
     }]
+
+def test_vision_claim_is_certified_by_an_independent_second_reading(tmp_path):
+    from code.vision import VisionEvidence
+
+    image = tmp_path / "image_01.png"
+    image.write_bytes(b"png")
+    images = pd.DataFrame([{
+        "image_id": "image_01", "user_id": "user_01", "request_id": "r1", "related_event_id": "event_01",
+    }])
+    events = [{
+        "event_id": "event_01",
+        "user_id": "user_01",
+        "request_id": "r1",
+        "amount": "",
+        "currency": "INR",
+        "category": "rent",
+    }]
+
+    resolved, warnings = resolve_event_amounts(
+        images,
+        events,
+        tmp_path,
+        reader=lambda _: VisionEvidence(
+            backend="vlm", raw_text="", amount=Decimal("100000"), currency="INR"
+        ),
+        corroborator=lambda _: VisionEvidence(
+            backend="tesseract", raw_text="Amount due 100000.00"
+        ),
+    )
+
+    assert resolved[0]["amount"] == "100000"
+    assert resolved[0]["amount_evidence_backend"] == "vlm+corroborated"
+    assert warnings == []
+
+
+def test_vision_claim_the_second_reading_contradicts_is_discarded(tmp_path):
+    from code.vision import VisionEvidence
+
+    image = tmp_path / "image_01.png"
+    image.write_bytes(b"png")
+    images = pd.DataFrame([{
+        "image_id": "image_01", "user_id": "user_01", "request_id": "r1", "related_event_id": "event_01",
+    }])
+    events = [{
+        "event_id": "event_01",
+        "user_id": "user_01",
+        "request_id": "r1",
+        "amount": "",
+        "currency": "INR",
+        "category": "rent",
+    }]
+
+    resolved, warnings = resolve_event_amounts(
+        images,
+        events,
+        tmp_path,
+        reader=lambda _: VisionEvidence(
+            backend="vlm", raw_text="", amount=Decimal("100000"), currency="INR"
+        ),
+        corroborator=lambda _: VisionEvidence(
+            backend="tesseract", raw_text="Amount due 5000.00"
+        ),
+    )
+
+    # The uncorroborated model figure is dropped; the independent reading wins.
+    assert resolved[0]["amount"] == "5000"
+    assert resolved[0]["amount_evidence_backend"] == "tesseract"

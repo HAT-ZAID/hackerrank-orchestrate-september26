@@ -16,10 +16,10 @@
         },
         "vlm": {
           "amount": "4365000",
-          "note": "",
+          "note": "certified by a second local reading (cached)",
           "backend": "vlm",
           "latency_ms": 11391,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -40,10 +40,10 @@
         },
         "vlm": {
           "amount": "100000",
-          "note": "",
+          "note": "certified by a second local reading (cached)",
           "backend": "vlm",
           "latency_ms": 8000,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -64,10 +64,10 @@
         },
         "vlm": {
           "amount": "41272.0",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 9296,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -81,17 +81,17 @@
       "results": {
         "tesseract": {
           "amount": "2854.00",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 969,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "2854.00",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 15671,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -105,17 +105,17 @@
       "results": {
         "tesseract": {
           "amount": "704.05",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 780,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "704.05",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 14750,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -129,17 +129,17 @@
       "results": {
         "tesseract": {
           "amount": "1995.00",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 1016,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "1995.00",
-          "note": "",
+          "note": "certified by a second local reading (cached)",
           "backend": "vlm",
           "latency_ms": 14546,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -153,17 +153,17 @@
       "results": {
         "tesseract": {
           "amount": "8528.10",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 703,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "8528.10",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 8703,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -177,17 +177,17 @@
       "results": {
         "tesseract": {
           "amount": "15339",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 842,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "15339",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 6641,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -201,17 +201,17 @@
       "results": {
         "tesseract": {
           "amount": "723.00",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 483,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "723",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 4046,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -225,17 +225,17 @@
       "results": {
         "tesseract": {
           "amount": "79679.26",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 2375,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "79679.26",
-          "note": "",
+          "note": "certified by a second local reading (cached)",
           "backend": "vlm",
           "latency_ms": 21594,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -249,17 +249,17 @@
       "results": {
         "tesseract": {
           "amount": "3650.00",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 953,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "3650.00",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 23907,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -273,17 +273,17 @@
       "results": {
         "tesseract": {
           "amount": "40.00",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 608,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "40.00",
-          "note": "model amount rejected, text used",
+          "note": "model amount rejected, text used (cached)",
           "backend": "vlm",
           "latency_ms": 4280,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -297,17 +297,17 @@
       "results": {
         "tesseract": {
           "amount": "2298",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 406,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "2298",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 4843,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -321,16 +321,16 @@
       "results": {
         "tesseract": {
           "amount": "—",
-          "note": "no labelled amount",
+          "note": "no labelled amount (cached)",
           "backend": "tesseract",
           "latency_ms": 437,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "error",
           "note": "model did not return JSON",
           "backend": "vlm",
-          "latency_ms": 38437,
+          "latency_ms": 49875,
           "cached": false
         }
       },
@@ -345,17 +345,17 @@
       "results": {
         "tesseract": {
           "amount": "9968.00",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 1094,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "1142513200",
-          "note": "model amount rejected, text used",
+          "note": "model amount rejected, text used (cached)",
           "backend": "vlm",
           "latency_ms": 10562,
-          "cached": false
+          "cached": true
         }
       },
       "agree": false
@@ -369,17 +369,17 @@
       "results": {
         "tesseract": {
           "amount": "393.22",
-          "note": "",
+          "note": "cached",
           "backend": "tesseract",
           "latency_ms": 702,
-          "cached": false
+          "cached": true
         },
         "vlm": {
           "amount": "393.22",
-          "note": "",
+          "note": "cached",
           "backend": "vlm",
           "latency_ms": 5656,
-          "cached": false
+          "cached": true
         }
       },
       "agree": true
@@ -387,11 +387,11 @@
   ],
   "cache": {
     "enabled": true,
-    "root": "data\\cache",
+    "root": "D:\\Hackerrank_Orchestrate\\the-month-end-agentic\\data\\cache",
     "ttl_days": 30.0,
-    "hits": 3,
-    "misses": 29,
-    "writes": 28,
+    "hits": 35,
+    "misses": 1,
+    "writes": 0,
     "expired": 0
   },
   "backends": [

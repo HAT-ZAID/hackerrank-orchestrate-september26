@@ -9,6 +9,7 @@ import pytest
 
 from code.cache import DiskCache
 from code.vision import (
+    _backend_model,
     ChainedBackend,
     DoclingBackend,
     QwenVLBackend,
@@ -371,6 +372,30 @@ def test_structured_amount_is_rejected_on_currency_mismatch():
     evidence = VisionEvidence(backend="vlm", raw_text="", amount=Decimal("10"), currency="USD")
 
     assert validate_evidence_amount(evidence, expected_currency="INR") is None
+
+
+def test_structured_amount_is_rejected_without_text_to_corroborate_it():
+    # An unreadable image is exactly where a small model likes to invent a figure.
+    evidence = VisionEvidence(backend="vlm", raw_text="", amount=Decimal("5000"), currency="")
+
+    assert validate_evidence_amount(evidence, expected_currency="INR") is None
+
+
+def test_structured_amount_is_rejected_when_the_parser_reads_no_amount():
+    evidence = VisionEvidence(
+        backend="vlm", raw_text="no totals on this page", amount=Decimal("5000"), currency="INR"
+    )
+
+    assert validate_evidence_amount(evidence, expected_currency="INR") is None
+
+
+def test_cache_key_includes_the_model_of_every_chained_backend():
+    first = ChainedBackend([QwenVLBackend(env={"BUY_WAIT_VLM_MODEL": "qwen3-vl:2b"}), TesseractBackend()])
+    second = ChainedBackend([QwenVLBackend(env={"BUY_WAIT_VLM_MODEL": "qwen3-vl:7b"}), TesseractBackend()])
+
+    assert _backend_model(first) != _backend_model(second)
+    assert "qwen3-vl:2b" in _backend_model(first)
+    assert _backend_model(TesseractBackend()) == ""
 
 
 @pytest.mark.parametrize("amount", [Decimal("0"), Decimal("-1"), None])

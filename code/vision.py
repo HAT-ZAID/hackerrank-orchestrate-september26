@@ -456,6 +456,18 @@ def build_backend(kind=None, *, env=None, cache=None) -> tuple[object | None, st
     return ChainedBackend(chain), None
 
 
+def _backend_model(backend) -> str:
+    """Model identity for the cache key, including every member of a chain."""
+    model = getattr(backend, "model", "")
+    if model:
+        return str(model)
+    parts = [
+        f"{getattr(member, 'name', '?')}={getattr(member, 'model', '')}"
+        for member in getattr(backend, "backends", []) or []
+    ]
+    return "|".join(parts)
+
+
 def read_evidence(
     image_path,
     backend=None,
@@ -484,7 +496,7 @@ def read_evidence(
         "image": path.name,
         "sha256": digest,
         "backend": label,
-        "model": getattr(backend, "model", ""),
+        "model": _backend_model(backend),
         "prompt_version": PROMPT_VERSION,
         "parser_version": PARSER_VERSION,
     }
@@ -505,13 +517,15 @@ def validate_evidence_amount(
     expected_currency: str | None,
     category: str | None = None,
     description: str | None = None,
+    corroborating_texts=(),
 ) -> dict | None:
     """Return a trusted ``{"amount", "currency"}``, or ``None``.
 
     A structured amount is accepted only when it is positive, bounded, in the
-    event's currency, and agrees with the deterministic parser whenever that
-    parser can read the same text.  Any disagreement rejects the structured value
-    and the caller falls back to text parsing.
+    event's currency, **and** the deterministic parser reads the same figure from
+    the same text.  No text, no parser reading, or a different figure all reject the
+    structured value; the caller then falls back to parsing the text itself, so a
+    model can never introduce a number the parser cannot corroborate.
     """
     amount = evidence.amount
     if amount is None or not isinstance(amount, Decimal) or amount <= 0 or amount > MAX_AMOUNT:
@@ -520,11 +534,15 @@ def validate_evidence_amount(
     evidence_currency = _text(evidence.currency).upper()
     if currency and evidence_currency and currency != evidence_currency:
         return None
-    if evidence.raw_text:
-        parsed = extract_amount_for_event(evidence.raw_text, currency or None, category, description)
-        if parsed is not None and parsed["amount"] != amount:
-            return None
-    return {"amount": amount, "currency": currency or evidence_currency or None}
+    texts = [evidence.raw_text] if evidence.raw_text else []
+    texts.extend(str(item or "") for item in corroborating_texts or ())
+    if not texts:
+        return None
+    for text in texts:
+        parsed = extract_amount_for_event(text, currency or None, category, description)
+        if parsed is not None and parsed["amount"] == amount:
+            return {"amount": amount, "currency": currency or evidence_currency or None}
+    return None
 
 
 __all__ = [
@@ -547,6 +565,7 @@ __all__ = [
     "VisionBackend",
     "VisionEvidence",
     "build_backend",
+    "_backend_model",
     "image_digest",
     "parse_vlm_payload",
     "read_evidence",

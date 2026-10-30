@@ -353,7 +353,7 @@ executes the live agent-robustness gate):
 | G2 | Agreement with the 25 labelled sample answers | **FAIL** (see below) |
 | G3 | Determinism: repeated runs byte-identical | **PASS** |
 | G4 | Provenance: output tied to commit and usage report | **PASS** |
-| G5 | Archive clean-room run | **NOT RUN** (no archive supplied; container build deferred ? see ?8) |
+| G5 | Archive clean-room run | **NOT RUN** (no archive supplied; container build deferred — see §8) |
 | G6 | Archive/history secret scan | **NOT RUN** (tree scan runs inside G0; archive scan needs G5) |
 | G7 | Agent robustness: a crashing agent changes nothing | **PASS** (4 checks) |
 
@@ -385,7 +385,7 @@ agent loop on purpose for two sample requests and requires that the pipeline sti
 finishes, that every machine field matches the deterministic baseline, that each
 crash is recorded in `usage["agent_loop_errors"]`, and that the same crash is named
 on stderr. A gate that only asserted "the loop exists" would have passed while the
-silent-failure bug in ?6.4 was still live; this one would have caught it.
+silent-failure bug in §6.4 was still live; this one would have caught it.
 
 ---
 
@@ -406,7 +406,7 @@ silent-failure bug in ?6.4 was still live; this one would have caught it.
    exists.
 6. **The agentic path is measured, not proven.** Three requests ran end to end under
    a 600 s budget and all three fell back to the kernel. That demonstrates the
-   guardrail, not that a capable remote model would converge ? the Kilo/Nemotron path
+   guardrail, not that a capable remote model would converge — the Kilo/Nemotron path
    is wired and documented but has never been run with real credentials.
 7. **`output.csv` is generated, not golden.** It is now rebuilt from the release run
    (250 rows, sha256 `1f35043f…`), but it reflects this build only. Regenerate it

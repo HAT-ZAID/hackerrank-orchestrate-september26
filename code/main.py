@@ -19,7 +19,7 @@ if __package__ in (None, ""):
     from code.evidence import resolve_event_amounts
     from code.explanations import generate_explanation
     from code.usage import new_usage, write_usage_report
-    from code.vision import build_backend, read_evidence
+    from code.vision import TesseractBackend, build_backend, read_evidence
     from code.cache import default_cache
 else:
     from code.solver import solve_request
@@ -27,7 +27,7 @@ else:
     from code.evidence import resolve_event_amounts
     from code.explanations import generate_explanation
     from code.usage import new_usage, write_usage_report
-    from code.vision import build_backend, read_evidence
+    from code.vision import TesseractBackend, build_backend, read_evidence
     from code.cache import default_cache
 
 import pandas as pd
@@ -236,11 +236,16 @@ def run_pipeline(
             ocr_available=ocr_path is not None,
         )
     else:
+        # A vision claim is certified by a deterministic reading of the same
+        # document.  The model's own transcript is tried first; when it yields no
+        # labelled amount, the local Tesseract read of that image acts as the
+        # independent second witness (and is cached like any other read).
         events, evidence_warnings = resolve_event_amounts(
             images,
             events,
             root / "dataset/media/images",
             reader=lambda image_path: read_evidence(image_path, vision_backend),
+            corroborator=lambda image_path: read_evidence(image_path, TesseractBackend()),
         )
 
     # Optional agent substrate (Task 5A) and bounded agent loop (Task 5B). Both

@@ -76,8 +76,11 @@ machine, never in the cloud.
 
 `BUY_WAIT_OCR_BACKEND=auto` tries Qwen3-VL, then Docling when configured, then
 Tesseract. A model-proposed amount is trusted only when it is positive, in the
-event's currency, and agrees with the deterministic parser reading the same text;
-otherwise the parser's own reading wins and the disagreement is recorded. A
+event's currency, and a deterministic reading of the same document reproduces it
+exactly. The model's own transcript counts first; when that transcript yields no
+labelled amount, an independent local Tesseract read of the same image acts as the
+second witness. If neither confirms the figure, it is discarded and the parser's own
+reading wins. A
 non-loopback VLM host is refused unless you set `BUY_WAIT_VLM_ALLOW_REMOTE=1`.
 Reads are cached on disk by image path, image bytes and backend, so repeat runs do
 no model work; entries older than `BUY_WAIT_CACHE_TTL_DAYS` (default 30) are treated
@@ -208,9 +211,15 @@ The 50-call cap is shared with the other remote providers.
 docker build -t month-end:test .
 docker run --rm month-end:test --help       # usage
 docker run --rm month-end:test              # deterministic batch inside /app
+touch output.csv                            # needed before a bind mount: Docker
+                                            # would otherwise create a directory
 docker run --rm -v "${PWD}/output.csv:/app/output.csv" month-end:test
 ```
 
+The container runs as uid **10001**, so a host `output.csv` must be writable by that
+user (on Linux: `chown 10001 output.csv`, or mount a writable directory and copy the
+file out). `code.main` always writes `/app/output.csv`, so a directory mount needs a
+code change and is not offered here.
 The image is `python:3.11-slim`, installs both requirement files plus Tesseract,
 runs as a non-root user, and reads `dataset/` from `/app`. Pass `-e
 BUY_WAIT_KILO_BASE_URL=... -e BUY_WAIT_KILO_API_KEY=...` to enable the remote

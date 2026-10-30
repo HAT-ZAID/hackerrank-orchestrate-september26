@@ -13,14 +13,17 @@ def _blank_amount(value) -> bool:
     return not text or text in {"nan", "none", "nat", "null"}
 
 
-def _read_outcome(read, image_path, event) -> tuple[dict | None, str, str, str | None]:
+def _read_outcome(read, image_path, event, corroborator=None) -> tuple[dict | None, str, str, str | None]:
     """Turn one reader result into ``(parsed, text, backend, error)``.
 
     A reader may return plain text (the historical Tesseract contract) or a
     :class:`~code.vision.VisionEvidence`.  A structured amount is only a *claim*:
     it is accepted when :func:`~code.vision.validate_evidence_amount` confirms it
-    against the event currency and the deterministic text parser.  Otherwise the
-    text is parsed the usual way, so a hallucinated number can never win.
+    against the event currency and some deterministic reading of the same document.
+    The model's own transcript counts first; when that transcript yields no
+    labelled amount, an independent ``corroborator`` (the local Tesseract read) is
+    consulted and the claim still needs an exact match.  Otherwise the text is
+    parsed the usual way, so a hallucinated number can never win.
     """
     category = event.get("category")
     description = event.get("description")
@@ -40,13 +43,46 @@ def _read_outcome(read, image_path, event) -> tuple[dict | None, str, str, str |
         )
         if parsed is None and text:
             parsed = extract_amount_for_event(text, currency, category, description)
+        if parsed is None and callable(corroborator):
+            # One independent second local reading, used two ways: it can certify a
+            # claimed amount (the claim still has to match it exactly), and when the
+            # vision transcript yields no usable amount at all it becomes the answer.
+            # The model is never the only witness to a number.
+            try:
+                other = corroborator(image_path)
+            except Exception:
+                other = ""
+            other_text = str(getattr(other, "raw_text", other) or "")
+            if other_text:
+                if getattr(result, "amount", None) is not None:
+                    parsed = validate_evidence_amount(
+                        result,
+                        expected_currency=currency,
+                        category=category,
+                        description=description,
+                        corroborating_texts=[other_text],
+                    )
+                    if parsed is not None:
+                        backend = f"{backend}+corroborated"
+                if parsed is None:
+                    parsed = extract_amount_for_event(other_text, currency, category, description)
+                    if parsed is not None:
+                        # The independent reader produced the amount: attribute it,
+                        # and keep the raw text that actually supported it.
+                        backend = "tesseract"
+                        text = other_text
         return parsed, text, backend, error
     text = str(result or "")
     return extract_amount_for_event(text, currency, category, description), text, "tesseract", None
 
 
-def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_available=None):
-    """Resolve blank event amounts from linked images without inventing values."""
+def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_available=None, corroborator=None):
+    """Resolve blank event amounts from linked images without inventing values.
+
+    ``corroborator`` is an optional independent reader (the local Tesseract path).
+    It is consulted only when a vision backend claims an amount its own transcript
+    cannot confirm, and the claim still has to match its reading exactly.
+    """
     resolved = deepcopy(events or [])
     event_ids = [str(e.get("event_id", "") or "").strip() for e in resolved]
     duplicate_ids = {event_id for event_id in event_ids if event_id}
@@ -94,7 +130,7 @@ def resolve_event_amounts(images_df, events, image_dir, reader=None, ocr_availab
                 continue
             try:
                 read_attempts += 1
-                parsed, ocr_text, backend, error = _read_outcome(read, image_path, event)
+                parsed, ocr_text, backend, error = _read_outcome(read, image_path, event, corroborator)
             except Exception:
                 ocr_text = ""
                 parsed = None

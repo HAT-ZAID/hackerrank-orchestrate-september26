@@ -55,7 +55,7 @@ def _load_links(root: Path):
     return links
 
 
-def _resolve_amount(evidence: VisionEvidence, event) -> str:
+def _resolve_amount(evidence: VisionEvidence, event, corroborating_texts=()) -> str:
     """The amount this reader supports, using the same trust rule as the pipeline."""
     currency = event.get("currency")
     parsed = validate_evidence_amount(
@@ -63,6 +63,7 @@ def _resolve_amount(evidence: VisionEvidence, event) -> str:
         expected_currency=currency,
         category=event.get("category"),
         description=event.get("description"),
+        corroborating_texts=corroborating_texts,
     )
     if parsed is None and evidence.raw_text:
         parsed = extract_amount_for_event(
@@ -73,11 +74,11 @@ def _resolve_amount(evidence: VisionEvidence, event) -> str:
     return f"{parsed['amount']}"
 
 
-def _cell(evidence: VisionEvidence, event) -> tuple[str, str]:
+def _cell(evidence: VisionEvidence, event, corroborating_texts=()) -> tuple[str, str]:
     """``(amount cell, note)`` for one backend."""
     if evidence.error:
         return "error", evidence.error
-    amount = _resolve_amount(evidence, event)
+    amount = _resolve_amount(evidence, event, corroborating_texts)
     note = "" if amount != "—" else "no labelled amount"
     if evidence.amount is not None and amount != "—":
         try:
@@ -85,9 +86,29 @@ def _cell(evidence: VisionEvidence, event) -> tuple[str, str]:
                 note = "model amount rejected, text used"
         except Exception:
             note = ""
+    if corroborating_texts and amount != "—" and note == "":
+        note = "certified by a second local reading"
     if evidence.cached:
         note = f"{note} (cached)".strip() if note else "cached"
     return amount, note
+
+
+def _corroborate(evidence: VisionEvidence, image_path: Path, event, cache, use_cache) -> tuple[str, str]:
+    """Report a claimed amount only when another local reader reproduces it.
+
+    This mirrors the pipeline: a vision model may propose a figure, but an
+    independent deterministic read of the same image has to confirm it.
+    """
+    amount, note = _cell(evidence, event)
+    if amount != "—" or evidence.amount is None or evidence.backend == "tesseract":
+        return amount, note
+    other = _run_backend("tesseract", image_path, cache, use_cache)
+    if other.error or not other.raw_text:
+        return amount, note
+    certified = _cell(evidence, event, corroborating_texts=[other.raw_text])
+    if certified[0] == "—":
+        return amount, note
+    return certified
 
 
 def _run_backend(kind: str, image_path: Path, cache, use_cache: bool):
@@ -140,7 +161,7 @@ def compare(root: Path, image_dir: Path, backends, limit=None, use_cache=True) -
         }
         for kind in backends:
             evidence = _run_backend(kind, image_path, cache, use_cache)
-            amount, note = _cell(evidence, event)
+            amount, note = _corroborate(evidence, image_path, event, cache, use_cache)
             row["results"][kind] = {
                 "amount": amount,
                 "note": note,
