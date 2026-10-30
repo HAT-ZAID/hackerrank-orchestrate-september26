@@ -67,7 +67,7 @@ def _trace_usage(trace_path) -> dict:
     return usage if isinstance(usage, dict) else {}
 
 
-def _run(limit, provider_name, trace_dir, timeout_s, max_turns=None, max_tool_calls=None):
+def _run(limit, provider_name, trace_dir, timeout_s, max_turns=None, max_tool_calls=None, offset=0):
     """Run the pipeline twice: plain kernel, then the agentic slice."""
     from code.main import run_pipeline
     from code.providers import build_provider
@@ -105,20 +105,29 @@ def _run(limit, provider_name, trace_dir, timeout_s, max_turns=None, max_tool_ca
         }
         return outcome
 
-    agentic, _ = run_pipeline(
+    agentic, run_usage = run_pipeline(
         write_output=False,
         write_usage=False,
         provider=provider,
         trace_dir=trace_dir,
-        agent_limit=limit,
+        # The loop always starts from the first request in dataset order, so an
+        # offset runs the longer slice and the summariser drops its head.
+        agent_limit=offset + limit,
         agent=instrumented,
     )
-    return baseline, agentic, recorded, provider, reason
+    return baseline, agentic, recorded, provider, reason, run_usage
 
 
-def _summarise(baseline, agentic, recorded, *, limit):
+def _summarise(baseline, agentic, recorded, *, limit, offset=0, loop_errors=None):
+    crash_by_id = {}
+    for item in loop_errors or []:
+        if isinstance(item, dict) and item.get("request_id"):
+            crash_by_id[str(item["request_id"])] = (
+                str(item.get("error") or "unknown error")
+                + (f" [{item.get('where')}]" if item.get("where") else "")
+            )
     rows = []
-    for request_id in list(agentic["request_id"])[:limit]:
+    for request_id in list(agentic["request_id"])[offset:offset + limit]:
         base = baseline[baseline["request_id"] == request_id].iloc[0]
         agent = agentic[agentic["request_id"] == request_id].iloc[0]
         detail = recorded.get(request_id, {})
@@ -139,12 +148,13 @@ def _summarise(baseline, agentic, recorded, *, limit):
                 "input_tokens": usage.get("input_tokens"),
                 "output_tokens": usage.get("output_tokens"),
                 "trace_error": detail.get("trace_error"),
+                "loop_error": crash_by_id.get(request_id),
             }
         )
     return rows
 
 
-def _markdown(rows, *, provider_label, provider_reason, limit) -> str:
+def _markdown(rows, *, provider_label, provider_reason, limit, offset=0) -> str:
     total_provider = sum(row["provider_calls"] or 0 for row in rows)
     total_tools = sum(row["tool_calls"] or 0 for row in rows)
     fallbacks = [row for row in rows if row["fallback_reason"]]
@@ -157,7 +167,9 @@ def _markdown(rows, *, provider_label, provider_reason, limit) -> str:
         "",
         f"Provider: `{provider_label}`"
         + (f" (unavailable: {provider_reason})" if provider_reason else ""),
-        f"Requests compared: **{len(rows)}** (first {limit} in dataset order)",
+        f"Requests compared: **{len(rows)}** ("
+        + (f"requests {offset + 1}-{offset + limit} in dataset order" if offset else f"first {limit} in dataset order")
+        + ")",
         "",
         "## Guardrail",
         "",
@@ -200,6 +212,14 @@ def _markdown(rows, *, provider_label, provider_reason, limit) -> str:
         lines += ["", "## Fallback reasons", ""]
         for row in fallbacks:
             lines.append(f"- `{row['request_id']}`: {row['fallback_reason']}")
+    crashed = [row for row in rows if row.get("loop_error")]
+    if crashed:
+        # A crashed invocation ran to the kernel without any provider call and
+        # without a normal fallback reason; hiding it would look like a skipped
+        # request, not a failure.
+        lines += ["", "## Crashed agent invocations", ""]
+        for row in crashed:
+            lines.append(f"- `{row['request_id']}`: {row['loop_error']}")
     lines += [
         "",
         "## Reading this",
@@ -216,6 +236,7 @@ def _markdown(rows, *, provider_label, provider_reason, limit) -> str:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--limit", type=int, default=5, help="requests to run through the agent (default 5)")
+    parser.add_argument("--offset", type=int, default=0, help="skip the first N requests so heavy runs can be chunked with cooldowns")
     parser.add_argument("--provider", default="ollama", choices=("ollama", "replay", "kilo", "openrouter", "none"))
     parser.add_argument("--model", default=None, help="model id for the chosen provider")
     parser.add_argument("--base-url", default=None, help="local Ollama base URL, e.g. http://127.0.0.1:11435")
@@ -244,14 +265,29 @@ def main(argv=None) -> int:
 
     if args.limit <= 0:
         parser.error("--limit must be positive")
+    if args.offset < 0:
+        parser.error("--offset cannot be negative")
     _configure_provider(args)
 
-    baseline, agentic, recorded, provider, reason = _run(
-        args.limit, args.provider, args.trace_dir, args.timeout
+    baseline, agentic, recorded, provider, reason, run_usage = _run(
+        args.limit,
+        args.provider,
+        args.trace_dir,
+        args.timeout,
+        max_turns=args.max_turns,
+        max_tool_calls=args.max_tool_calls,
+        offset=args.offset,
     )
-    rows = _summarise(baseline, agentic, recorded, limit=args.limit)
+    rows = _summarise(
+        baseline,
+        agentic,
+        recorded,
+        limit=args.limit,
+        offset=args.offset,
+        loop_errors=(run_usage or {}).get("agent_loop_errors"),
+    )
     label = f"{getattr(provider, 'name', args.provider)}:{getattr(provider, 'model', args.model or '')}"
-    report = _markdown(rows, provider_label=label, provider_reason=reason, limit=args.limit)
+    report = _markdown(rows, provider_label=label, provider_reason=reason, limit=args.limit, offset=args.offset)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

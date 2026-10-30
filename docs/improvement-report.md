@@ -200,7 +200,8 @@ Full table: [`docs/ocr-comparison.md`](ocr-comparison.md).
 
 ## 6. Agentic vs non-agentic
 
-*(run 1: `llama3.2:3b`, 5 requests, 6-turn budget, details in §6.1)*
+*(run 1: `llama3.2:3b`, 5 requests, shipped 6-turn budget, §6.1. Run 2: same
+model, 600 s per-call timeout, §6.4.)*
 
 The point of the experiment is not "is the LLM smarter". It is: **does adding an
 LLM loop change any number the user acts on?** If it does, that is a bug.
@@ -233,10 +234,10 @@ not a planner. It can say what a receipt contains; it cannot hold a multi-step
 plan, choose which evidence to fetch, and converge on a typed proposal inside a
 bounded budget on this hardware.
 
-The honest options are (a) raise the turn budget and timeout and accept the
-latency (the 600 s / 10-turn rerun is planned, results will be appended), (b) use
-a larger tool-capable model, or (c) keep the loop for explanation and let the
-kernel do the planning — which is what the product does by default.
+The honest options are (a) raise the timeout and accept the latency — attempted in
+§6.4 and it did not change the conclusion, (b) use a larger tool-capable model, or
+(c) keep the loop for explanation and let the kernel do the planning — which is what
+the product does by default.
 
 ### 6.3 Why the fallback is a feature
 
@@ -244,6 +245,47 @@ When the agent fails, times out, or exceeds its budget, the request keeps the
 kernel's row and the trace records why. A user sees a correct answer and an honest
 note, not a hallucinated plan. The 50-call run-wide cap exists for the same reason:
 an agent that can spend money without a ceiling is a liability.
+
+### 6.4 Run 2: a bigger timeout, the same wall
+
+The obvious objection to §6.2 is "the model ran out of time, not ability". So run 2
+raised the per-call timeout from 180 s to 600 s and re-measured.
+
+| Metric | Run 2 |
+|---|---|
+| Requests that actually ran the loop | 3 (`request_26`, `request_27`, `request_28`) |
+| Machine fields identical to the kernel | **3/3** |
+| Explanations rewritten | 0/3 |
+| Requests that fell back | 3/3 |
+| Wall clock per request | 55 s, 600.4 s (timeout), 454.1 s |
+
+What the extra time bought: `request_28` reached six provider calls and six tool
+calls in 454 s and still handed back a `propose_decision` the schema rejected for the
+same missing fields as in run 1. `request_27` spent its entire 600 s on a single
+provider call and timed out. Six times the patience produced zero additional valid
+proposals. The 3B model does not fail for lack of time; it fails at producing the
+typed artefact.
+
+Two methodological corrections belong in the record, because both were bugs in our
+own measurement harness rather than in the product:
+
+1. The `--max-turns` / `--max-tool-calls` flags were accepted by the comparison
+   script but never forwarded to the loop runner, so every "bigger budget" run was
+   really the shipped 6/6 budget. The flags now reach the runner; run 2 is therefore
+   described as *600 s timeout at the shipped budget*, not a 10-turn experiment.
+2. The `--offset` flag was applied only to the reported slice, not to the run
+   length, so a window like "requests 29–30" was reported with rows that were never
+   actually executed (the loop always starts at the first request in dataset order).
+   The runner now receives `offset + limit` and the slice is taken from rows that
+   really ran. This is why this section reports three requests, not five: the last
+   two were never measured, and an unmeasured row must not be printed as a result.
+
+A third issue was found and fixed in the pipeline itself: a crashing agent
+invocation was swallowed by a bare `except Exception`, which is exactly how the
+unmeasured rows above first looked like "silent successes". A crash now prints the
+request id and the error frame to stderr and is recorded in
+`usage["agent_loop_errors"]`, so the comparison report has a `Crashed agent
+invocations` section instead of a wall of blanks.
 
 ---
 
@@ -301,7 +343,8 @@ leaves the kernel exactly as it was, and 15 offline tests pin that behaviour.
 
 ## 7. Where the quality actually stands
 
-Collected from `python -m evaluation.run --mode pr`:
+Collected from `python -m evaluation.run --mode release` (the release run also
+executes the live agent-robustness gate):
 
 | Gate | Meaning | Result |
 |---|---|---|
@@ -310,6 +353,9 @@ Collected from `python -m evaluation.run --mode pr`:
 | G2 | Agreement with the 25 labelled sample answers | **FAIL** (see below) |
 | G3 | Determinism: repeated runs byte-identical | **PASS** |
 | G4 | Provenance: output tied to commit and usage report | **PASS** |
+| G5 | Archive clean-room run | **NOT RUN** (no archive supplied; container build deferred ? see ?8) |
+| G6 | Archive/history secret scan | **NOT RUN** (tree scan runs inside G0; archive scan needs G5) |
+| G7 | Agent robustness: a crashing agent changes nothing | **PASS** (4 checks) |
 
 G2 is the honest one. On the 25 public samples:
 
@@ -332,7 +378,14 @@ says the spending-change reasoning is not yet good enough, because the missing
 gold actions are mostly `stop:` / `reduce_to:` choices we did not propose.
 
 That is the next real piece of work: better candidate generation for spending
-changes (Task 10 follow-up), not more prompt engineering.
+changes, not more prompt engineering.
+
+G7 is new in this release. It is not a paperwork slot any more: the gate breaks the
+agent loop on purpose for two sample requests and requires that the pipeline still
+finishes, that every machine field matches the deterministic baseline, that each
+crash is recorded in `usage["agent_loop_errors"]`, and that the same crash is named
+on stderr. A gate that only asserted "the loop exists" would have passed while the
+silent-failure bug in ?6.4 was still live; this one would have caught it.
 
 ---
 
@@ -349,9 +402,15 @@ changes (Task 10 follow-up), not more prompt engineering.
    not been spent, and the local 2B model could not finish the agent loop.
 5. **Docker is unverified.** The image definition exists and is checked by tests,
    but it has not been built here because the development machine ran out of disk
-   space. Treat the first build as unproven.
-6. **`output.csv` in the repository is stale** until the final release run
-   regenerates it.
+   space. Treat the first build as unproven; G5/G6 stay NOT RUN until an archive
+   exists.
+6. **The agentic path is measured, not proven.** Three requests ran end to end under
+   a 600 s budget and all three fell back to the kernel. That demonstrates the
+   guardrail, not that a capable remote model would converge ? the Kilo/Nemotron path
+   is wired and documented but has never been run with real credentials.
+7. **`output.csv` is generated, not golden.** It is now rebuilt from the release run
+   (250 rows, sha256 `1f35043f…`), but it reflects this build only. Regenerate it
+   after any forecast or policy change; G4 ties the file to the commit that made it.
 
 ---
 
@@ -364,6 +423,8 @@ python -m evaluation.run --mode pr  # the gates above
 python -m code.agent --provider ollama --model qwen3:4b-instruct   # agent demo
 python -m tools.compare_ocr --backend both                          # OCR comparison
 python -m tools.compare_agentic --limit 3                           # agent vs kernel
+python -m tools.compare_jev                                        # JEV audit (needs OpenCode Zen)
+python -m code.cache --stats --purge                               # cache hygiene
 ```
 
 Everything above works offline. The optional remote deployment provider is

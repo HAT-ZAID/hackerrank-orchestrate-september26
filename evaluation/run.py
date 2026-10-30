@@ -454,6 +454,88 @@ def provenance_gate(metrics: dict) -> dict:
     return make_gate("G4", "provenance", True, PASS if not problems else FAIL, detail)
 
 
+def agent_robustness_gate(root: Path) -> dict:
+    """G7: a crashing agent must change no row and must not crash the run.
+
+    The loop is deliberately broken for the first two sample requests. The gate
+    passes only when the pipeline still completes, every machine field matches the
+    deterministic baseline, and each crash is recorded instead of swallowed.
+    """
+    from code.main import run_pipeline
+
+    sample = root / "dataset" / "sample_requests.csv"
+    checks: list[dict] = []
+
+    baseline, _ = run_pipeline(
+        repo_root=root, requests_path=sample, write_output=False, write_usage=False
+    )
+
+    invoked: list[str] = []
+
+    def explode(context, **_kwargs):
+        invoked.append(str(context.get("request_id")))
+        raise RuntimeError("gate: deliberate agent failure")
+
+    crashed, usage = None, {}
+    stderr_text = ""
+    try:
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            crashed, usage = run_pipeline(
+                repo_root=root,
+                requests_path=sample,
+                write_output=False,
+                write_usage=False,
+                agent_limit=2,
+                agent=explode,
+            )
+        stderr_text = buffer.getvalue()
+    except Exception as exc:  # a gate must report, never explode
+        stderr_text = f"gate harness error: {type(exc).__name__}: {exc}"
+    errors = [item for item in (usage.get("agent_loop_errors") or []) if isinstance(item, dict)]
+
+    checks.append({
+        "name": "pipeline survives a crashing agent",
+        "status": PASS if crashed is not None and len(crashed) == len(baseline) else FAIL,
+        "detail": f"{len(crashed) if crashed is not None else 0} rows produced",
+    })
+    identical = crashed is not None and baseline.equals(crashed)
+    checks.append({
+        "name": "machine fields identical to the kernel",
+        "status": PASS if identical else FAIL,
+        "detail": "row-for-row identical" if identical else "a crashed agent changed a row",
+    })
+    attempted = len(invoked) == 2
+    checks.append({
+        "name": "loop invoked for the requested requests",
+        "status": PASS if attempted else FAIL,
+        "detail": f"invoked {len(invoked)}: {', '.join(invoked) or 'none'}",
+    })
+    recorded = len(errors) == len(invoked) and all(item.get("error") for item in errors)
+    checks.append({
+        "name": "crashes recorded, not swallowed",
+        "status": PASS if recorded else FAIL,
+        "detail": f"{len(errors)} recorded error(s)",
+    })
+    announced = all(rid in stderr_text for rid in invoked) if invoked else False
+    checks.append({
+        "name": "crash announced on stderr",
+        "status": PASS if announced else FAIL,
+        "detail": "each crashed request named on stderr" if announced else "no stderr line for a crashed request",
+    })
+
+    failed = [check["name"] for check in checks if check["status"] == FAIL]
+    detail = (
+        f"{len(checks)} checks passed: crashed agent changed nothing"
+        if not failed
+        else f"failed: {', '.join(failed)}"
+    )
+    return make_gate("G7", "agent_robustness", True, PASS if not failed else FAIL, detail, checks)
+
+
 def release_gate_slots(archive_path=None) -> list[dict]:
     if archive_path is None:
         archive_detail = "no --archive supplied"
@@ -464,7 +546,7 @@ def release_gate_slots(archive_path=None) -> list[dict]:
         else:
             archive_detail = (
                 f"archive present: {path.name} sha256 {str(sha256_file(path))[:12]}; "
-                "clean-room and non-root execution checks land with Task 7"
+                "clean-room execution is deferred (no container build in this environment)"
             )
     return [
         make_gate(
@@ -479,14 +561,14 @@ def release_gate_slots(archive_path=None) -> list[dict]:
             "security",
             True,
             NOT_APPLICABLE,
-            "tree secret scan runs in G0; archive/history scan lands with Task 7",
+            "tree secret scan runs in G0; archive/history scanning needs an --archive",
         ),
         make_gate(
             "G7",
             "agent_robustness",
             True,
             NOT_APPLICABLE,
-            "agent/tool loop does not exist yet (Task 5)",
+            "replaced by the live robustness gate in release mode",
         ),
     ]
 
@@ -630,9 +712,9 @@ def run_structural_checks(root: Path) -> tuple[dict, dict]:
 def _pr_release_slots() -> list[dict]:
     slots = release_gate_slots(archive_path=None)
     reasons = {
-        "G5": "archive clean-room checks land with Task 7",
-        "G6": "archive/history scan lands with Task 7; tree secret scan runs in G0",
-        "G7": "agent/tool loop lands with Task 5",
+        "G5": "archive clean-room checks need an --archive",
+        "G6": "archive/history scanning needs an --archive; tree secret scan runs in G0",
+        "G7": "the live agent-robustness gate runs in release mode",
     }
     for slot in slots:
         slot["required"] = False
@@ -1081,6 +1163,11 @@ def write_reports(report: dict, report_dir: Path) -> tuple[Path, Path]:
 def run_release(root: Path, archive_path=None, provider: str = "replay") -> dict:
     report = run_pr(root, provider=provider)
     release_slots = release_gate_slots(archive_path=archive_path)
+    # G7 is real in release mode: break the loop on purpose and prove nothing moves.
+    robustness = agent_robustness_gate(Path(root))
+    release_slots = [
+        robustness if gate.get("id") == "G7" else gate for gate in release_slots
+    ]
     gates = [
         gate for gate in report["gates"] if gate.get("id") not in {"G5", "G6", "G7"}
     ] + release_slots

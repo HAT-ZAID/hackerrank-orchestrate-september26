@@ -6,6 +6,7 @@ and writes output.csv.
 Run with: python -m code.main (from repo root)
 """
 import sys
+import traceback
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
@@ -310,11 +311,18 @@ def run_pipeline(
                 "store": getattr(getattr(retriever, "fts", None), "store", None),
                 "limit": agent_count,
                 "used": 0,
+                # A swallowed agent crash must never stay invisible: kernel rows
+                # still stand, but the report has to be able to say it happened.
+                "errors": [],
             }
 
     # Prepare output rows
     output_rows = []
     usage = new_usage()
+    if loop_state is not None:
+        # Same list object as loop_state["errors"]: crashes recorded while the
+        # per-request loop runs are visible in the returned usage dict too.
+        usage["agent_loop_errors"] = loop_state["errors"]
     for _, req in requests.iterrows():
         user_id = req["user_id"]
         profile = profiles[profiles["user_id"] == user_id].iloc[0].to_dict()
@@ -378,7 +386,23 @@ def run_pipeline(
                     tools=loop_state["toolbox"],
                     trace=loop_state["recorder"],
                 )
-            except Exception:
+            except Exception as exc:
+                # Silent None here is what hid run-2's request 29/30 holes: the
+                # kernel row is unchanged, so keep it, but say what broke.
+                detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                entry = {"request_id": req["request_id"], "error": detail}
+                # Where it died: the last traceback frame for this exception.
+                try:
+                    frame = traceback.extract_tb(sys.exc_info()[2])[-1]
+                    entry["where"] = f"{frame.name} at {frame.filename}:{frame.lineno}"
+                except Exception:
+                    pass
+                loop_state["errors"].append(entry)
+                print(
+                    f"[agent loop] {req['request_id']} crashed and fell back to the kernel: "
+                    + str(entry.get("where") or "") + " " + detail,
+                    file=sys.stderr,
+                )
                 outcome = None
             if outcome is not None:
                 agent_outcome = outcome

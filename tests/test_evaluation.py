@@ -111,6 +111,19 @@ def test_release_mode_gates_are_not_applicable():
     ) == ("INCOMPLETE", 2)
 
 
+def test_agent_robustness_gate_passes_when_the_agent_crashes():
+    from pathlib import Path
+
+    root = Path(evalrun.__file__).resolve().parent.parent
+    gate = evalrun.agent_robustness_gate(root)
+
+    assert gate["id"] == "G7"
+    assert gate["status"] == "PASS", gate["detail"]
+    names = {check["name"] for check in gate["checks"]}
+    assert "machine fields identical to the kernel" in names
+    assert "crashes recorded, not swallowed" in names
+
+
 def test_report_emission_is_stable(tmp_path):
     gates = [evalrun.make_gate("G0", "structural", True, "PASS", "ok")]
     metrics = {"safety": {"status_upgrades": 0, "safe_overclaims": 0}}
