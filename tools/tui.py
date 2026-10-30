@@ -85,6 +85,7 @@ Commands:
   diff <id>             original decision vs the current overlaid decision
   undo [<id>]           drop the overrides of one request, or of all
   explain <id>          print the decision_explanation in the decision
+  ask <instruction>     run a plain-language task (multi-step, session only)
   help                  this text
   quit                  leave; nothing is written to disk
 
@@ -95,7 +96,16 @@ actions:        stop:<event_id>  or  reduce_to:<event_id>:<new_amount>
 batch; `new` adds an in-memory manual_0001-style request and solves only that.
 `trace` reads an agent trace file (never a live call) from --trace-dir
 (default traces/latest) and never launches a browser.
-Edits are session-only: output.csv and dataset/ are never written."""
+Edits are session-only: output.csv and dataset/ are never written.
+
+ask examples:
+  ask can I afford 40,000 on the 12th
+  ask why was request_NNN refused
+  ask where am I leaking money, then tell me if I can still pay rent on the 3rd
+  ask stop my delivery membership
+  ask and if I wait until the 20th
+Each clause becomes a step: the reply names what it did, what changed, what it
+refused, and where the task trace was written."""
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +653,9 @@ class TUI:
         # Session-only manual requests (llm-free, never written to disk).
         self._manual_ids: set[str] = set()
         self._manual_counter = 0
+        # Task traces (`ask`) are written here; the request traces above stay
+        # read-only, this directory is the only thing `ask` writes.
+        self.task_trace_dir = REPO_ROOT / "traces" / "tasks"
 
     # -- plumbing ----------------------------------------------------------
 
@@ -1024,6 +1037,9 @@ class TUI:
         if request_id is None:
             return
         path = find_trace(self.trace_dir, request_id)
+        if path is None:
+            # `ask` writes its own task traces; `trace task_...` should find them.
+            path = find_trace(self.task_trace_dir, request_id)
         if path is None:
             self.console.print(
                 f"no trace for {request_id} under {self.trace_dir}; run the agent with "
@@ -1437,6 +1453,47 @@ class TUI:
             explanation or "(the computed decision carries no explanation)", style="italic"
         )
 
+    def cmd_ask(self, args) -> None:
+        """Plain-language task over the same session (multi-step, session only)."""
+        instruction = " ".join(args).strip()
+        if not instruction:
+            self.console.print(
+                "usage: ask <instruction>, e.g. "
+                "`ask can I afford 40,000 on the 12th`",
+                style="red",
+            )
+            return
+        data = self._ensure_data()
+        if data is None:
+            return
+        from code.task_agent import Workspace, run_task
+
+        workspace = Workspace(data=data, session=self.session)
+        result = run_task(instruction, workspace=workspace, trace_dir=self.task_trace_dir)
+        # The task engine solves through the same kernel, so keep the TUI's
+        # per-request cache hot with what it just computed.
+        self._cache.update(workspace._cache)
+        for index, step in enumerate(result.steps, start=1):
+            label = f"[{index}/{len(result.steps)}] {step.kind}"
+            style = {
+                "ok": "green",
+                "refused": "yellow",
+                "unknown": "yellow",
+                "error": "red",
+            }.get(step.status, None)
+            self.console.print(f"{label}: {step.text}", style="bold")
+            self.console.print(step.detail or "(no detail)", style=style, soft_wrap=True)
+        if result.actions_applied:
+            applied = ", ".join(
+                f"{item['action']} -> {item['request_id']}"
+                for item in result.actions_applied
+            )
+            self.console.print(f"applied in this session: {applied} (`undo` reverts)")
+        else:
+            self.console.print("nothing was changed in this session")
+        if result.trace_path:
+            self.console.print(f"task trace: {result.trace_path}", style="dim")
+
 
 def _reconfigure_stdout() -> None:
     """Keep box-drawing characters intact when stdout is not UTF-8."""
@@ -1469,6 +1526,7 @@ def run_tui(data=None, input_fn=input, trace_dir=None) -> None:
         "diff": app.cmd_diff,
         "undo": app.cmd_undo,
         "explain": app.cmd_explain,
+        "ask": app.cmd_ask,
         "help": app.cmd_help,
     }
     while True:
