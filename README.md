@@ -69,8 +69,11 @@ Two layers, with a hard boundary between them:
    The agent owns three things and nothing else:
    - the **explanation**, shipped only when every amount, date, status and action
      in it is reproduced by the kernel row (`code/claims.py`);
-   - a **guarded spending change**, shipped only when the re-solved plan raises
-     the safe amount and the event is permitted and unprotected;
+   - a **guarded spending change proposal**: the kernel re-solves it and accepts
+     it only when the event is permitted, unprotected and the re-solved plan
+     raises the safe amount — but the shipped row keeps the kernel's own
+     `spending_changes_needed`, so an accepted proposal is advice, not a change
+     to the answer;
    - **concerns** about unreadable or conflicting evidence, which change no number.
 
    Schema errors and ledger disagreements are fed back to the model with the exact
@@ -248,8 +251,10 @@ The loop now treats a rejection as feedback instead of a stop condition:
   by the kernel row (`code/claims.py`). Wrong about the plan, still allowed to
   explain it; never allowed to invent a number.
 - **Guarded spending changes.** `propose_spending_change` lets the model try a
-  permitted `stop`/`reduce_to`; the kernel re-solves and the change is accepted
-  only when it actually raises the safe amount.
+  permitted `stop`/`reduce_to`; the kernel re-solves and accepts it only when it
+  actually raises the safe amount. The shipped row still carries the kernel's own
+  `spending_changes_needed`: the proposal is a tested recommendation, not an
+  edit to the answer.
 - **Concerns.** `raise_concern` records unreadable evidence or ambiguity in the
   trace and the task report. It never changes a number.
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import sys
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
@@ -1032,6 +1033,46 @@ class TUI:
             return
         self.console.print(render_decision(decision), soft_wrap=True)
 
+    def _render_task_trace(self, path) -> bool:
+        """Print a task trace; ``False`` when the file is not one."""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(payload, dict) or not payload.get("task_id"):
+            return False
+        table = Table(
+            title=f"task {payload['task_id']}",
+            show_header=False,
+            box=None,
+            pad_edge=False,
+        )
+        table.add_column("field", style="bold")
+        table.add_column("value")
+        table.add_row("instruction", str(payload.get("instruction") or ""))
+        table.add_row("summary", str(payload.get("summary") or ""))
+        steps = payload.get("steps") or []
+        table.add_row("steps", str(len(steps)))
+        self.console.print(table)
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            intent = (step.get("data") or {}).get("intent") or {}
+            source = intent.get("source") if isinstance(intent, dict) else None
+            suffix = f" (intent {intent.get('intent')}, {source})" if source else ""
+            self.console.print(
+                f"  - {step.get('kind')}: {step.get('status')}{suffix}: "
+                f"{step.get('text') or ''}",
+                style="dim",
+            )
+        actions = payload.get("actions_applied") or []
+        if actions:
+            self.console.print(f"  actions applied: {', '.join(map(str, actions))}")
+        concerns = payload.get("concerns") or []
+        if concerns:
+            self.console.print(f"  concerns: {len(concerns)}")
+        return True
+
     def cmd_trace(self, args) -> None:
         """Read-only summary of one agent trace file (never a live call)."""
         request_id = self._one_id(args, "trace")
@@ -1052,6 +1093,10 @@ class TUI:
         try:
             trace = load_trace(path)
         except TraceError as exc:
+            # Task traces are not request traces: they carry `task_id` and an
+            # ordered step list instead of a request row. Render those directly.
+            if self._render_task_trace(path):
+                return
             self.console.print(f"trace unreadable: {exc}", style="red")
             return
         summary = summarise(trace)
@@ -1491,7 +1536,13 @@ class TUI:
         )
         # The task engine solves through the same kernel, so keep the TUI's
         # per-request cache hot with what it just computed.
-        self._cache.update(workspace._cache)
+        self._cache.update(
+            {
+                key: value
+                for key, value in workspace._cache.items()
+                if not key.startswith(MANUAL_PREFIX)
+            }
+        )
         for index, step in enumerate(result.steps, start=1):
             label = f"[{index}/{len(result.steps)}] {step.kind}"
             reading = (step.data or {}).get("intent") or {}

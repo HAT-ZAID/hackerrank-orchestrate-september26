@@ -72,7 +72,7 @@ detection here — it changes *which step runs*, never the numbers.
 | Field | Path | Guard |
 |---|---|---|
 | `decision_explanation` | rationale ships when every claim is reproduced by the kernel | `code/claims.py` |
-| `spending_changes_needed` | `propose_spending_change` | kernel re-solve must raise the safe amount; event must be permitted and unprotected |
+| `spending_changes_needed` | `propose_spending_change` | kernel re-solve must raise the safe amount; event must be permitted and unprotected; the shipped row keeps the kernel's value, so an accepted proposal is advice |
 | nothing else | — | kernel row, always |
 
 Claim checking catches the two failure modes that matter:
@@ -100,7 +100,9 @@ propose_spending_change(event_1, stop)     -> refused
 ```
 
 A change is accepted only when the re-solved safe amount actually rises. The
-model proposes; the ledger decides.
+model proposes; the ledger decides. The shipped row still carries the kernel's
+own `spending_changes_needed`, so an accepted proposal is a tested
+recommendation rather than an edit to the answer.
 
 ## Concerns
 

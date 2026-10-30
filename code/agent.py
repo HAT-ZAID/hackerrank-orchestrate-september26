@@ -106,6 +106,9 @@ REQUEST_SCOPED_TOOLS = (
     "get_payment_options",
     "get_cashflow_projection",
     "list_spending_change_candidates",
+    "search_spending_changes",
+    "compare_payment_options",
+    "propose_spending_change",
 )
 #: Tools whose optional request filter is forced to the active request *when the
 #: model supplies one*, so a probe cannot point at another request's evidence.
@@ -1136,8 +1139,9 @@ def run_agent_loop(
                     state["repairs"] += 1
                     # A small model repeats its own shape unless it is told, in
                     # plain words, which keys were missing.
+                    skip_rest("not executed: the proposal was rejected")
                     messages.append(_message("human", _repair_message(rejection)))
-                    continue
+                    break
                 missing = _missing_steps(state)
                 if missing:
                     state["nag"] += 1
@@ -1199,6 +1203,8 @@ def run_agent_loop(
                 )
                 _record_repair(state, rejection, trace, enabled)
                 state["repairs"] += 1
+                # Every tool call already has its reply at this point, so the
+                # repair message can follow them directly.
                 messages.append(_message("human", _repair_message(rejection)))
                 proposal = None
                 continue

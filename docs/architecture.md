@@ -87,7 +87,7 @@ change anything except when it already agreed. The contribution paths today:
 | Path | Guard |
 |---|---|
 | `decision_explanation` | every amount, date, status/method name and spending-change action must be reproduced by the kernel row (`code/claims.py`); grounds prose without agreement |
-| `spending_changes_needed` | `propose_spending_change` is accepted only when the kernel re-solve raises the safe amount and the event is permitted and unprotected |
+| `spending_changes_needed` | `propose_spending_change` is accepted only when the kernel re-solve raises the safe amount and the event is permitted and unprotected; the shipped row keeps the kernel's value, so an accepted proposal is advice, not an edit |
 | Intent / routing | `code/intent.py`; a wrong reading costs a turn, never a number |
 | Concerns | `raise_concern` writes to the trace only |
 | Task actions | `code/task_agent.py`; session-only and reversible |

@@ -27,7 +27,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -848,10 +848,26 @@ class Toolbox:
                 target = Decimal(str(new_amount).replace(",", ""))
             except (InvalidOperation, ValueError, TypeError):
                 raise ToolError("reduce_to needs a numeric new_amount")
-            ceiling = Decimal(str(value))
-            if target <= 0 or target >= ceiling:
+            # Compare against what the event costs today, not against the
+            # permitted action's floor: the floor is the lower bound that
+            # `_validate_change_tokens` enforces, so using it here as a ceiling
+            # would make every reduce_to impossible.
+            current = None
+            for event in self._user_events(user_id):
+                if _text(event.get("event_id")) != _text(event_id):
+                    continue
+                try:
+                    current = Decimal(str(event.get("amount")).replace(",", ""))
+                except (InvalidOperation, TypeError, ValueError):
+                    current = None
+                break
+            if current is None:
                 raise ToolError(
-                    f"new_amount must be above 0 and below the current {money_text(ceiling)}"
+                    f"{event_id} has no readable current amount, so it cannot be reduced"
+                )
+            if target <= 0 or target >= current:
+                raise ToolError(
+                    f"new_amount must be above 0 and below the current {money_text(current)}"
                 )
             value = target
         token = (
@@ -940,6 +956,7 @@ class Toolbox:
             for option in (data or {}).get("eligible") or []
         }
         rows = []
+        priced = []
         for option in (data or {}).get("supplied") or []:
             option_id = _text(option.get("payment_option_id"))
             total = option.get("total_payable_amount")
@@ -962,13 +979,17 @@ class Toolbox:
                     "eligible": option_id in eligible,
                 }
             )
-        feasible = [row for row in rows if row["eligible"]]
-        feasible.sort(key=lambda row: _amount_key(row.get("total_payable_amount")))
+            # An option whose total cannot be read is not the cheapest one; it
+            # is an option with an unknown price.
+            if option_id in eligible and total_value is not None:
+                priced.append((total_value, option_id))
+        priced.sort(key=lambda item: item[0])
         return {
             "request_id": str(request_id),
             "options": rows,
-            "cheapest_eligible": feasible[0]["payment_option_id"] if feasible else "",
-            "eligible_count": len(feasible),
+            "cheapest_eligible": priced[0][1] if priced else "",
+            "eligible_count": len([row for row in rows if row["eligible"]]),
+            "priced_eligible_count": len(priced),
         }
 
     @_structured
