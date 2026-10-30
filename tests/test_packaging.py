@@ -40,6 +40,7 @@ SAFE_ENV_VALUES = {
     "120",
     "180",
     "300",
+    "60",
     "30",
     "0",
     "1",
@@ -49,6 +50,8 @@ SAFE_ENV_VALUES = {
     KILO_DEFAULT_MODEL,
     "http://localhost:11434",
     "http://127.0.0.1:11434",
+    "jev-1.13-free",
+    "https://opencode.ai/inference/systemone/v1/systemone",
 }
 
 ENV_ASSIGNMENT = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]*)=(.*)$", re.MULTILINE)
@@ -108,6 +111,11 @@ def test_env_example_documents_kilo_and_the_local_vision_names():
         "BUY_WAIT_CACHE_DIR",
         "BUY_WAIT_CACHE_TTL_DAYS",
         "BUY_WAIT_CACHE_DISABLE",
+        "OPENCODE_API_KEY",
+        "OPENCODE_AUTH_JSON",
+        "BUY_WAIT_JEV_BASE_URL",
+        "BUY_WAIT_JEV_MODEL",
+        "BUY_WAIT_JEV_TIMEOUT",
     ):
         assert f"{name}=" in text, f"{name} missing from .env.example"
 

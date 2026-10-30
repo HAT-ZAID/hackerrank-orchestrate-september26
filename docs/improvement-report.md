@@ -238,6 +238,58 @@ an agent that can spend money without a ceiling is a liability.
 
 ---
 
+## 6x. A second mind, checked: the JEV decision gate
+
+A different experiment asks a different question: not "can a model plan", but
+**"does an independent, differently-shaped model agree with the kernel?"** Jev
+(TypeSafe's decision model, run through OpenCode Zen) is *not* a chat model. You
+hand it a compact state and typed propositions, and it returns probabilities.
+It cannot write prose, cannot plan, cannot call tools — which makes it a nearly
+ideal auditor for a verifier-driven product.
+
+How it is wired: for each of the 25 labelled sample requests, `tools/compare_jev.py`
+sends one `noul`-proposition set per request — "the status is X" for all four
+statuses, "the method is Y" for all five methods, "this decision keeps the balance
+above the minimum after every commitment", "the facts given are sufficient" — and
+takes the argmax as the model's answer. The kernel's row is never modified.
+
+What came out of the live run (free tier, 25/25 answered, zero cost):
+
+| Question | Result |
+|---|---|
+| Status: Jev matches the kernel | **25 / 25** |
+| Method: Jev matches the kernel | 23 / 25 |
+| Mean status probability | 0.83 |
+| Mean method probability | 0.80 |
+| Safety proposition (mean noul) | 0.57 |
+
+Reading it like an auditor:
+
+- **Perfect status agreement from an outsider is the strongest independent
+  evidence so far** that the kernel's affordability calls are consistent with
+  what a differently-trained model reads in the same facts — with the caveat
+  below about who reads what.
+- The two method disagreements are the same two requests where the kernel says
+  `not_recommended` under its calibration and the sample answer later says the
+  request is affordable (`request_01`, `request_02`). Jev prefers `wait`: it
+  agrees the user should not pay *today*, but believes the request is payable
+  eventually. That is the same calibration gap G2 shows, seen through a second
+  model — which is exactly what a gate is for.
+- The safety proposition is the least confident signal (mean 0.57), and its
+  *lowest* values land on requests the kernel already declined. Wording matters:
+  a declined purchase trivially preserves the balance, so a low plausibility
+  here reads as Jev questioning the situation, not the decision. Treated as
+  calibration data, not as a verdict.
+- Engineering honesty: the free tier refuses typed `choice`/`score` questions
+  (HTTP 422) — everything above is `noul`-only; Cloudflare blocks Python's
+  default user agent (HTTP 403 code 1010) so the client declares an explicit
+  one; the paid tier was not usable (insufficient funds), so nothing was spent.
+
+The gate is fail-open by design: no key, a refused call, or a malformed answer
+leaves the kernel exactly as it was, and 15 offline tests pin that behaviour.
+
+---
+
 ## 7. Where the quality actually stands
 
 Collected from `python -m evaluation.run --mode pr`:

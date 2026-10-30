@@ -89,6 +89,19 @@ python -m code.cache --purge --stats    # delete expired entries now
 
 Comparison results live in [`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
 
+### Optional JEV decision audit (OpenCode Zen)
+
+`tools/compare_jev.py` is an experiment, not a decision source: it asks the
+TypeSafe **Jev** decision model (free `jev-1.13-free` through OpenCode Zen) to
+reproduce the kernel's affordability status and payment method as typed
+probabilities, and to rate each decision's safety and evidence sufficiency.
+The deterministic kernel still owns every machine field; the audit never edits a
+row. It needs an OpenCode API key (`OPENCODE_API_KEY`, or the signed-in
+`auth.json`), it is the only network call outside optional agent providers, and
+the free tier answers `noul` propositions only, which the tool encodes as an
+11-proposition argmax. Results live in
+[`docs/jev-decision-gate.md`](./docs/jev-decision-gate.md).
+
 See [`docs/architecture.md`](./docs/architecture.md) for the module map and data
 flow, and [`docs/edge-case-policy.md`](./docs/edge-case-policy.md) for the
 governed edge cases.
