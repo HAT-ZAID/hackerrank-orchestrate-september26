@@ -621,6 +621,14 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
         }
 
     best = ranked[0]
+    # `wait` means "a full payment becomes safe on this date". When the winning
+    # wait plan only works after a permitted spending change, the base projection
+    # has no safe date at all, and reporting an empty date next to "wait" is a
+    # contradiction. The base amount stays untouched (it is the pre-change value
+    # by contract); only this date follows the recommended plan.
+    reported_earliest = earliest
+    if best["payment_method"] == "wait" and _is_iso_date(best.get("earliest_date")):
+        reported_earliest = best["earliest_date"]
     explanation = f"Recommended {best['payment_method']} ({best['affordability_status']})."
     if best.get("spending_changes") not in (None, "", "none"):
         explanation = (
@@ -636,7 +644,7 @@ def solve_request(rid, user_id, req_date, req_amt, profile, events, fx_rows, opt
         "affordability_status": best["affordability_status"],
         "recommended_payment_method": best["payment_method"],
         "payment_plan": best["payment_plan"],
-        "earliest_date_for_full_payment": earliest,
+        "earliest_date_for_full_payment": reported_earliest,
         "spending_changes_needed": best["spending_changes"],
         "decision_explanation": explanation,
         "evidence": evidence,

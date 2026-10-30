@@ -134,7 +134,11 @@ def test_changed_ledger_can_make_wait_meet_deadline(monkeypatch):
     assert result["affordability_status"] == "affordable_later"
     assert result["spending_changes_needed"] == "stop:event_change"
     assert result["payment_plan"] == "2026-01-05:5000"
-    assert result["earliest_date_for_full_payment"] == "2026-02-01"
+    # A wait plan that only works after the change must report that plan's date:
+    # an empty date next to "wait" would contradict the recommendation.
+    assert result["earliest_date_for_full_payment"] == "2026-01-05"
+    # The amount stays the base (pre-change) value by contract.
+    assert result["amount_safe_to_pay"] == "0"
 
 
 def test_no_change_plan_is_preferred_over_an_unneeded_change(monkeypatch):
