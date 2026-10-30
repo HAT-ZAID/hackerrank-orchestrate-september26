@@ -807,6 +807,15 @@ def run_agent_loop(
         raise ValueError("run_agent_loop needs a Toolbox")
 
     kernel_result = _kernel_for(tools, request_id)
+    # The facts the model is shown: used to route the first turn and to let the
+    # claim check accept a rationale that cites them.
+    facts: dict = {}
+    try:
+        fetched = tools.call("get_request_context", request_id)
+        if isinstance(fetched, dict) and fetched.get("ok"):
+            facts = dict(fetched.get("data") or {})
+    except Exception:  # a failed read only narrows what prose may cite
+        facts = {}
     if retriever is not None and getattr(tools, "retriever", None) is None:
         tools.retriever = retriever
 
@@ -837,7 +846,7 @@ def run_agent_loop(
         trace_path = None
         trace_error = None
         if verification is None:
-            amounts, dates = _context_facts(context)
+            amounts, dates = _context_facts(context, facts)
             outcome = enforce_decision(
                 candidate,
                 kernel_result,
@@ -1176,7 +1185,7 @@ def run_agent_loop(
         if proposal is not None:
             if enabled:
                 trace.record("candidate", {"candidate": proposal})
-            amounts, dates = _context_facts(context)
+            amounts, dates = _context_facts(context, facts)
             outcome = enforce_decision(
                 proposal,
                 kernel_result,
@@ -1279,14 +1288,30 @@ def _repair_message(rejection: dict) -> str:
     )
 
 
-def _context_facts(context: dict) -> tuple[tuple, tuple]:
-    """Amounts and dates the model legitimately saw, for the claim check."""
-    request = context.get("request") if isinstance(context, dict) else None
+def _context_facts(context: dict, payload=None) -> tuple[tuple, tuple]:
+    """Amounts and dates the model legitimately saw, for the claim check.
+
+    A rationale may cite the request amount, the request dates and the two
+    balance figures it was shown; those are facts, not fabrication. Without them
+    the check rejects correct prose, which is its own kind of failure.
+    """
+    context = context if isinstance(context, dict) else {}
+    request = context.get("request")
     if not isinstance(request, dict):
         request = {}
+    profile = {}
+    data = payload if isinstance(payload, dict) else {}
+    if isinstance(data.get("request"), dict):
+        request = {**data["request"], **request}
+    if isinstance(data.get("profile"), dict):
+        profile = data["profile"]
     amounts = tuple(
         value
-        for value in (request.get("requested_amount"),)
+        for value in (
+            request.get("requested_amount"),
+            profile.get("current_available_balance"),
+            profile.get("minimum_balance_to_keep"),
+        )
         if value not in (None, "")
     )
     dates = tuple(

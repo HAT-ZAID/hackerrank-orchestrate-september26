@@ -123,3 +123,40 @@ def test_verifier_ships_a_grounded_rationale_even_when_fields_disagree():
     # machine fields still come from the kernel
     assert result["final_row"]["affordability_status"] == "affordable_now"
     assert result["final_row"]["amount_safe_to_pay"] == "15656000"
+
+def test_context_facts_cover_what_the_model_was_shown():
+    from code.agent import _context_facts
+
+    amounts, dates = _context_facts(
+        {"request_id": "request_demo"},
+        {
+            "request": {
+                "requested_amount": "20500",
+                "request_date": "2026-06-01",
+                "desired_completion_date": "2026-07-05",
+            },
+            "profile": {
+                "current_available_balance": "1048.86",
+                "minimum_balance_to_keep": "1100",
+            },
+        },
+    )
+    assert set(amounts) == {"20500", "1048.86", "1100"}
+    assert set(dates) == {"2026-06-01", "2026-07-05"}
+
+
+def test_a_rationale_may_cite_the_request_amount_it_was_given():
+    from code.agent import _context_facts
+
+    amounts, dates = _context_facts(
+        {},
+        {"request": {"requested_amount": "6670", "request_date": "2026-07-05"}},
+    )
+    report = verify_claims(
+        "The 20,500 request is affordable now: 6,670.00 is safe today.",
+        {**ROW, "amount_safe_to_pay": "6670", "request_id": "request_demo"},
+        extra_numbers=amounts,
+        extra_dates=dates,
+    )
+    # 20,500 was never supplied, so it stays rejected even with the extras.
+    assert report["ok"] is False

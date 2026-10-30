@@ -656,6 +656,7 @@ class TUI:
         # Task traces (`ask`) are written here; the request traces above stay
         # read-only, this directory is the only thing `ask` writes.
         self.task_trace_dir = REPO_ROOT / "traces" / "tasks"
+        self._provider_notice = False
 
     # -- plumbing ----------------------------------------------------------
 
@@ -1475,7 +1476,8 @@ class TUI:
             provider, provider_reason = build_provider()
         except Exception as exc:  # offline stays the default
             provider, provider_reason = None, f"{type(exc).__name__}: {exc}"
-        if provider is None and provider_reason:
+        if provider is None and provider_reason and not self._provider_notice:
+            self._provider_notice = True
             self.console.print(
                 f"no model configured ({provider_reason}); classifying with the rules",
                 style="dim",

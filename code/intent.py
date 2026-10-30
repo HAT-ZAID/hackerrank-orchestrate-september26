@@ -183,10 +183,10 @@ def deterministic_intent(
     intent = "analysis"
     if re.search(r"\b(and then|then|after that|;)\b", lowered) or (clause_count or 0) > 1:
         intent = "compound"
+    elif re.search(r"\b(why|explain|how come|justify|can i|should i|is it|will i)\b", lowered):
+        intent = "question"
     elif re.search(r"\b(undo|stop|cancel|reduce|apply|pay|transfer|move)\b", lowered):
         intent = "action"
-    elif re.search(r"\b(why|explain|how come|justify)\b", lowered):
-        intent = "question"
     elif re.search(r"\b(if|until|what if|wait)\b", lowered):
         intent = "follow_up"
 
