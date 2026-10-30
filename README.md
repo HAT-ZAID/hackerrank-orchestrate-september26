@@ -23,6 +23,28 @@ competition scaffolding is still in the repository (the dataset, the eight-colum
 export, the evaluation gates), but the product is now meant to be used
 day to day, offline, on your own data.
 
+### How that submission scored
+
+The **chat transcript** signal was scored **9/10** — participant-reported. The
+other three signals were not published back to participants, so this repository
+makes no claim about them, and 9/10 is **not** the overall score.
+
+That number covers 10% of the total. Per the HackerRank help article for this
+edition — which notes the weights can vary between editions — the total was
+`0.10 × chat + 0.30 × interview + 0.30 × output CSV + 0.30 × code ZIP`, and the
+transcript rubric rewarded:
+
+| Transcript dimension | Weight |
+|---|---|
+| Direction and architecture ownership (choosing tradeoffs, pushing back) | 35% |
+| Technical specificity and constraint (models, libraries, schemas, thresholds) | 25% |
+| Iteration and verification (tests, output inspection, regressions, targeted fixes) | 25% |
+| Safety and edge-case awareness (adversarial input, injection, hallucination risk) | 15% |
+
+That signal grades how the human directed the coding agent, not the agent that
+was built. The code here is judged on the other three, and it is meant to be
+readable on its own terms.
+
 ## What it produces
 
 Every decision is one row with eight columns. The first seven are computed in
