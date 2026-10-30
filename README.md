@@ -155,8 +155,24 @@ python -m tools.tui
 ```
 
 Everything you do there — `list`, `show`, `dashboard`, `whatif`, `changes`,
-`apply`, `diff`, `undo`, `new`, `explain`, `trace` — is session-only. The TUI
-never writes `output.csv` or `dataset/` and never calls a model provider.
+`apply`, `diff`, `undo`, `new`, `explain`, `trace`, `ask` — is session-only. The
+TUI never writes `output.csv` or `dataset/`.
+
+`ask` is the conversational surface: plain-language instructions, split into
+ordered steps, each one executed against the same kernel.
+
+```text
+tui> ask why was request_101 refused
+tui> ask where am I leaking money, then stop the worst one
+tui> ask can I afford 40,000 on the 12th
+tui> ask and if I wait until the 20th
+```
+
+Each step reports what it did, what changed, and what it refused (with the
+nearest safe alternative). `python -m code.task_agent "<instruction>"` runs the
+same engine from the terminal, and `--provider ollama --model <id>` lets the
+model classify clauses the rules cannot read. Without a provider the rules answer
+alone, so nothing here needs a key.
 
 ### 4. Run the evaluation gates
 
@@ -199,10 +215,30 @@ export BUY_WAIT_OLLAMA_NUM_PREDICT=1024
 ```
 
 Sampling can change what the model *says*, never what the answer *is*: the seven
-machine-readable columns always come from the kernel, and a proposal that
-disagrees with the kernel is dropped. `propose_decision` takes the ten candidate
-fields as flat tool arguments — small local models drop free-form fields when the
-payload is nested under a single wrapper key, so the schema is flat on purpose.
+machine-readable columns always come from the kernel. `propose_decision` takes the
+ten candidate fields as flat tool arguments — small local models drop free-form
+fields when the payload is nested under a single wrapper key, so the schema is
+flat on purpose.
+
+The loop now treats a rejection as feedback instead of a stop condition:
+
+- **Intent first.** Every request is classified (`code/intent.py`) before the
+  first model call. The reading is deterministic and free; when a *clause* in a
+  task cannot be parsed by the rules, the model classifies it and the trace
+  records which reading won (`model` or `deterministic_fallback`).
+- **Repair turns.** A schema rejection or a disagreement with the ledger is sent
+  back with the exact fix ("you proposed X for `payment_plan`, the ledger computes
+  Y; re-read `get_cashflow_projection` and resubmit all ten fields"), bounded by
+  `BUY_WAIT_AGENT_REPAIR_TURNS` (default 2, max 5).
+- **Claim-checked explanations.** A model's `rationale` ships only when every
+  amount, date, status/method name and spending-change action in it is reproduced
+  by the kernel row (`code/claims.py`). Wrong about the plan, still allowed to
+  explain it; never allowed to invent a number.
+- **Guarded spending changes.** `propose_spending_change` lets the model try a
+  permitted `stop`/`reduce_to`; the kernel re-solves and the change is accepted
+  only when it actually raises the safe amount.
+- **Concerns.** `raise_concern` records unreadable evidence or ambiguity in the
+  trace and the task report. It never changes a number.
 
 ### 6. Optional: Kilo + Nemotron Ultra deployment
 

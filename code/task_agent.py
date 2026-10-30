@@ -29,6 +29,7 @@ TUI's rich console is not needed.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -36,12 +37,17 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from code.amounts import parse_amount
+from code.intent import detect_intent, deterministic_intent
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TRACE_DIR = REPO_ROOT / "traces" / "tasks"
 MAX_STEPS = 8
 # How many requests the default-target scan is allowed to solve.
 DEFAULT_SCAN = 40
+# A local model can take a minute to cold-load before it answers; the intent
+# classifier must not be cut off at a network-request timeout.
+INTENT_TIMEOUT_ENV = 'BUY_WAIT_INTENT_TIMEOUT'
+DEFAULT_INTENT_TIMEOUT = 120.0
 
 STATUS_OK = "ok"
 STATUS_REFUSED = "refused"
@@ -924,6 +930,33 @@ def _pick_request(workspace: Workspace, why: str) -> str | None:
 # --- the task loop ---------------------------------------------------------
 
 
+def _spec_from_intent(intent, clause: str) -> StepSpec | None:
+    """Turn a model classification into a step the engine can execute.
+
+    Returns ``None`` when the classification says a parameter is still missing,
+    which becomes a clarifying question rather than a guess.
+    """
+    params: dict = {"clause": clause}
+    if intent.target_request_id:
+        params["request_id"] = intent.target_request_id
+    if intent.target_event_id:
+        params["event_id"] = intent.target_event_id
+    if intent.intent == "action":
+        if intent.target_event_id:
+            params["action"] = "stop"
+            return StepSpec("apply", clause, params)
+        return StepSpec("changes", clause, params)
+    if intent.intent == "follow_up":
+        params["amount"] = extract_money(clause)
+        params["date"] = extract_date(clause)
+        return StepSpec("whatif", clause, params)
+    if intent.intent == "question":
+        return StepSpec("explain", clause, params)
+    if intent.intent in ("analysis", "compound"):
+        return StepSpec("changes", clause, params)
+    return None
+
+
 def run_task(
     instruction,
     *,
@@ -933,11 +966,25 @@ def run_task(
     trace_dir=None,
     max_steps: int = MAX_STEPS,
     reference_date: date | None = None,
+    provider=None,
+    intent_timeout_s: float | None = None,
 ) -> TaskResult:
-    """Parse and execute one instruction, step by step."""
+    """Parse and execute one instruction, step by step.
+
+    ``provider`` is optional: when given, clauses the grammar cannot classify are
+    sent to the model's intent classifier, and every step records which reading
+    drove it (``model`` or ``deterministic_fallback``). Without a provider the
+    rules answer alone.
+    """
     text = str(instruction or "").strip()
     task_id = f"task_{datetime.now().strftime('%Y%m%dT%H%M%S')}_{abs(hash(text)) % 10000:04d}"
     result = TaskResult(task_id=task_id, instruction=text)
+    if intent_timeout_s is None:
+        raw_timeout = os.environ.get(INTENT_TIMEOUT_ENV, '')
+        try:
+            intent_timeout_s = float(raw_timeout) if raw_timeout.strip() else DEFAULT_INTENT_TIMEOUT
+        except ValueError:
+            intent_timeout_s = DEFAULT_INTENT_TIMEOUT
     workspace = workspace or Workspace(data=data, session=session)
     if workspace.data is None:
         result.concerns.append("dataset unavailable")
@@ -945,6 +992,45 @@ def run_task(
         return result
 
     specs = parse_instruction(text, reference=reference_date)
+    known_requests = [
+        str(row.get("request_id", "")) for row in workspace.data.get("requests", [])
+    ]
+    known_events = sorted(
+        {
+            str(event.get("event_id", ""))
+            for events in workspace.data.get("events_by_user", {}).values()
+            for event in events
+        }
+    )
+    for spec in specs:
+        reading = (
+            detect_intent(
+                spec.text,
+                provider=provider,
+                timeout_s=intent_timeout_s,
+                known_requests=known_requests,
+                known_events=known_events,
+                clause_count=len(specs),
+            )
+            if spec.kind == "unknown" and provider is not None
+            else deterministic_intent(
+                spec.text,
+                known_requests=known_requests,
+                known_events=known_events,
+                clause_count=len(specs),
+            )
+        )
+        spec.params["intent"] = reading.as_dict()
+        if spec.kind != "unknown" or reading.source != "model":
+            continue
+        if reading.missing_parameters:
+            spec.params["clarify"] = reading.missing_parameters
+            continue
+        replacement = _spec_from_intent(reading, spec.text)
+        if replacement is not None:
+            replacement.params["intent"] = reading.as_dict()
+            spec.kind, spec.params = replacement.kind, replacement.params
+
     if not specs:
         result.summary = (
             "I did not catch an instruction. Try `can I afford 40,000 on the 12th`, "
@@ -965,12 +1051,20 @@ def run_task(
             step = _whatif(workspace, spec)
         elif spec.kind == "undo":
             step = _undo(workspace, spec)
+        elif spec.params.get("clarify"):
+            step = StepResult(
+                "clarify", spec.text, STATUS_REFUSED,
+                "I need one more thing before I can act: "
+                + str(spec.params["clarify"])
+                + ".",
+            )
         else:
             step = StepResult(
                 "unknown", spec.text, STATUS_UNKNOWN,
                 "I did not understand that clause. I can check affordability, explain "
                 "a decision, list spending changes, apply one, run a what-if, or undo.",
             )
+        step.data.setdefault("intent", spec.params.get("intent") or {})
         result.steps.append(step)
 
     result.summary = "\n".join(
@@ -1023,14 +1117,51 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--no-trace", action="store_true", help="do not write a trace file"
     )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        choices=("none", "ollama", "openrouter", "kilo"),
+        help=(
+            "model used for intent classification when the rules cannot read a "
+            "clause (default: none, rules only)"
+        ),
+    )
+    parser.add_argument("--model", default=None, help="model id for --provider")
     args = parser.parse_args(argv)
+
+    provider = None
+    if args.provider and args.provider != "none":
+        import os
+
+        from code.providers import build_provider
+
+        os.environ["BUY_WAIT_LLM_PROVIDER"] = args.provider
+        if args.model:
+            model_env = {
+                "ollama": "BUY_WAIT_OLLAMA_MODEL",
+                "openrouter": "BUY_WAIT_LLM_MODEL",
+                "kilo": "BUY_WAIT_KILO_MODEL",
+            }[args.provider]
+            os.environ[model_env] = args.model
+        provider, reason = build_provider()
+        if provider is None:
+            print(f"provider unavailable: {reason}")
 
     instruction = " ".join(args.instruction)
     result = run_task(
-        instruction, trace_dir=None if args.no_trace else Path(args.trace_dir)
+        instruction,
+        trace_dir=None if args.no_trace else Path(args.trace_dir),
+        provider=provider,
     )
     for index, step in enumerate(result.steps, start=1):
-        print(f"[{index}/{len(result.steps)}] {step.kind} ({step.status})")
+        reading = (step.data or {}).get("intent") or {}
+        label = f"[{index}/{len(result.steps)}] {step.kind} ({step.status})"
+        if reading.get("intent"):
+            label += (
+                f" intent={reading['intent']}/{reading.get('request_kind', 'ambiguous')}"
+                f" via {reading.get('source')}"
+            )
+        print(label)
         print(f"  {step.detail}")
     if result.trace_path:
         print(f"task trace: {result.trace_path}")

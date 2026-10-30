@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -46,6 +47,7 @@ from code.schema import (
     PAYMENT_METHODS,
     stable_json,
 )
+from code.intent import deterministic_intent
 from code.verifier import enforce_decision
 
 #: Bumped whenever the proposal contract changes shape.  ``agent-loop-v2`` is
@@ -72,16 +74,33 @@ AGENT_TOOLS = (
     "get_cashflow_projection",
     "get_payment_options",
     "list_spending_change_candidates",
+    "search_spending_changes",
+    "compare_payment_options",
+    "reconcile_receipts",
+    "propose_spending_change",
+    "raise_concern",
     "propose_decision",
 )
 
 MAX_TOOL_MESSAGE_CHARS = 4000
 MAX_FINAL_RETRIES = 1
 
+# Repair turns: how many times a rejected proposal may be corrected before the
+# kernel row stands. A rejection is feedback, not a stop condition; the cap keeps
+# a looping model from burning the run budget.
+REPAIR_TURNS_ENV = "BUY_WAIT_AGENT_REPAIR_TURNS"
+DEFAULT_REPAIR_TURNS = 2
+MAX_REPAIR_TURNS = 5
+
 #: Tools that must be scoped to the active user before dispatch, and tools that
 #: must be scoped to the active request.  ``search_messages`` is not exposed to
 #: the loop today (allowlist); it is listed here as defence in depth.
-USER_SCOPED_TOOLS = ("search_evidence", "search_messages", "get_financial_events")
+USER_SCOPED_TOOLS = (
+    "search_evidence",
+    "search_messages",
+    "get_financial_events",
+    "reconcile_receipts",
+)
 REQUEST_SCOPED_TOOLS = (
     "get_request_context",
     "get_payment_options",
@@ -258,6 +277,71 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "type": "object",
             "properties": {"request_id": {"type": "string"}},
             "required": ["request_id"],
+        },
+    },
+    "search_spending_changes": {
+        "description": (
+            "Rank the permitted stop/reduce actions by the safe amount each one "
+            "unlocks, computed by the kernel. Use it before proposing a change."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"request_id": {"type": "string"}},
+            "required": ["request_id"],
+        },
+    },
+    "compare_payment_options": {
+        "description": (
+            "Compare the supplied payment options on total payable, financing fee "
+            "and eligibility. Arithmetic over the rows, never a new quote."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"request_id": {"type": "string"}},
+            "required": ["request_id"],
+        },
+    },
+    "reconcile_receipts": {
+        "description": (
+            "Which events owe their amount to a receipt image, which backend read it, "
+            "and which amounts are still unresolved."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"user_id": {"type": "string"}},
+            "required": [],
+        },
+    },
+    "propose_spending_change": {
+        "description": (
+            "Try one permitted stop or reduce_to action. The kernel re-solves; the "
+            "change is accepted only when it raises the safe amount. Returns the "
+            "accepted change or the reason it was refused."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "event_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["stop", "reduce_to"]},
+                "new_amount": {"type": "string"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["request_id", "event_id", "action"],
+        },
+    },
+    "raise_concern": {
+        "description": (
+            "Record something a human should look at (unreadable evidence, ambiguity, "
+            "conflicting records). It changes no number."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "detail": {"type": "string"},
+            },
+            "required": ["kind", "detail"],
         },
     },
     "propose_decision": {
@@ -740,7 +824,10 @@ def run_agent_loop(
         "projection": False,
         "nag": 0,
         "final_retry": 0,
+        "repairs": 0,
+        "repair_log": [],
         "failures": {},
+        "concerns": [],
         "retrieval": None,
         "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
@@ -750,13 +837,32 @@ def run_agent_loop(
         trace_path = None
         trace_error = None
         if verification is None:
-            outcome = enforce_decision(candidate, kernel_result, request_context=context)
+            amounts, dates = _context_facts(context)
+            outcome = enforce_decision(
+                candidate,
+                kernel_result,
+                request_context=context,
+                extra_numbers=amounts,
+                extra_dates=dates,
+            )
             verification = dict(outcome["verification"])
             row = outcome["final_row"]
             if fallback_reason:
                 verification["fallback_reason"] = fallback_reason
+        if state.get("repair_log"):
+            # Keep the repair history on the verification, and when the run ends
+            # on a fallback, report what the last rejected proposal got wrong.
+            verification["repair_log"] = list(state["repair_log"])
+            if not verification.get("differences"):
+                last = state["repair_log"][-1]
+                if last.get("differences"):
+                    verification["differences"] = [
+                        dict(item) for item in last["differences"]
+                    ]
         if enabled:
             try:
+                if state.get("concerns"):
+                    trace.record("concerns", list(state["concerns"]))
                 trace.record("verification", verification)
                 trace.record("final_row", row)
                 trace.record(
@@ -810,6 +916,13 @@ def run_agent_loop(
         )
 
     def fallback(reason: str) -> AgentResult:
+        if state.get("repair_log") and "kernel" not in reason:
+            # Say what actually happened: the run used its repair turns and the
+            # kernel row is what ships.
+            reason = (
+                f"{reason}; {len(state['repair_log'])} proposal(s) were sent back "
+                "for repair and the deterministic kernel row stands"
+            )
         if enabled:
             trace.record("agent_fallback", {"reason": reason})
         return finish(fallback_reason=reason)
@@ -842,9 +955,22 @@ def run_agent_loop(
     if not callable(getattr(bound, "invoke", None)):
         return fallback("provider returned an unsupported chat model (no invoke)")
 
+    # Deterministic intent reading (free, always available). It routes the first
+    # turn and is recorded, so a trace shows what the agent believed the request
+    # was before it spent a model call.
+    request_text = ""
+    request = context.get("request") if isinstance(context, dict) else None
+    if isinstance(request, dict):
+        request_text = str(request.get("request_text") or "")
+    reading = deterministic_intent(
+        request_text or str(request_id), clause_count=1
+    )
+    if enabled:
+        trace.record("intent", reading.as_dict())
+
     messages = [
         _message("system", SYSTEM_PROMPT),
-        _message("human", _facts_prompt(context)),
+        _message("human", _facts_prompt(context) + "\n" + _routing_hint(reading)),
     ]
 
     while True:
@@ -992,24 +1118,22 @@ def run_agent_loop(
                     state["failures"]["propose_decision"] = (
                         state["failures"].get("propose_decision", 0) + 1
                     )
-                    if state["failures"]["propose_decision"] > 1:
+                    rejection = _rejection(
+                        "schema",
+                        str(envelope.get("error") or "invalid candidate"),
+                        attempt=state["failures"]["propose_decision"],
+                    )
+                    _record_repair(state, rejection, trace, enabled)
+                    if state["repairs"] >= repair_limit():
                         return fallback(
-                            "propose_decision failed twice: "
-                            + str(envelope.get("error") or "invalid candidate")
+                            "propose_decision rejected after "
+                            f"{state['failures']['propose_decision']} attempt(s): "
+                            + rejection["detail"]
                         )
+                    state["repairs"] += 1
                     # A small model repeats its own shape unless it is told, in
                     # plain words, which keys were missing.
-                    messages.append(
-                        _message(
-                            "human",
-                            "That call was rejected: "
-                            + str(envelope.get("error") or "invalid candidate")
-                            + ". Call propose_decision again and include ALL ten "
-                            "keys as arguments: "
-                            + ", ".join(CANDIDATE_FIELDS)
-                            + ".",
-                        )
-                    )
+                    messages.append(_message("human", _repair_message(rejection)))
                     continue
                 missing = _missing_steps(state)
                 if missing:
@@ -1031,6 +1155,10 @@ def run_agent_loop(
                 break
 
             envelope = tools.call(name, **args)
+            if name == "raise_concern" and envelope.get("ok"):
+                state.setdefault("concerns", []).append(
+                    dict(envelope.get("data") or {})
+                )
             _note_step(tools, state, name, envelope, trace, enabled)
             if not envelope.get("ok"):
                 state["failures"][name] = state["failures"].get(name, 0) + 1
@@ -1048,7 +1176,139 @@ def run_agent_loop(
         if proposal is not None:
             if enabled:
                 trace.record("candidate", {"candidate": proposal})
-            return finish(proposal)
+            amounts, dates = _context_facts(context)
+            outcome = enforce_decision(
+                proposal,
+                kernel_result,
+                request_context=context,
+                extra_numbers=amounts,
+                extra_dates=dates,
+            )
+            verification = dict(outcome["verification"])
+            differences = verification.get("differences") or []
+            if differences and state["repairs"] < repair_limit():
+                # A disagreement is data: tell the model which field it got wrong
+                # and what the ledger computed, then let it resubmit.
+                rejection = _rejection(
+                    "disagreement",
+                    "the proposal disagrees with the computed ledger",
+                    differences=differences,
+                )
+                _record_repair(state, rejection, trace, enabled)
+                state["repairs"] += 1
+                messages.append(_message("human", _repair_message(rejection)))
+                proposal = None
+                continue
+            return finish(proposal, row=outcome["final_row"], verification=verification)
+
+
+def repair_limit(env=None) -> int:
+    """How many repair turns this run allows (never negative, never unbounded)."""
+    raw = (env or os.environ).get(REPAIR_TURNS_ENV)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_REPAIR_TURNS
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_REPAIR_TURNS
+    return max(0, min(value, MAX_REPAIR_TURNS))
+
+
+ROUTING_HINTS = {
+    "purchase": "Check the projected safe amount before proposing a payment method.",
+    "bill": "Bills are usually fixed: check the due date and the protected categories.",
+    "subscription_renewal": (
+        "A renewal can often be stopped or reduced: call "
+        "list_spending_change_candidates before deciding."
+    ),
+    "installment_request": (
+        "Installments cost more in total: call get_payment_options and compare the "
+        "total payable against paying in full."
+    ),
+    "transfer": "Transfers leave the account for good: be conservative with dates.",
+    "ambiguous": "The request text is ambiguous: gather evidence before proposing.",
+}
+
+
+def _routing_hint(reading) -> str:
+    """One line telling the model what kind of request it is looking at."""
+    kind = getattr(reading, "request_kind", "ambiguous")
+    intent = getattr(reading, "intent", "analysis")
+    hint = ROUTING_HINTS.get(kind, ROUTING_HINTS["ambiguous"])
+    return (
+        f"This request reads as {kind} ({intent}). {hint} "
+        "It is a hint, not a fact: if the evidence disagrees, trust the evidence."
+    )
+
+
+def _rejection(kind: str, detail: str, **extra) -> dict:
+    """One structured reason a proposal was refused."""
+    payload = {"kind": kind, "detail": detail}
+    payload.update({key: value for key, value in extra.items() if value is not None})
+    return payload
+
+
+def _repair_message(rejection: dict) -> str:
+    """The system turn that names the exact fix for a rejected proposal."""
+    if rejection.get("kind") == "schema":
+        return (
+            "That call was rejected: "
+            + str(rejection.get("detail") or "invalid candidate")
+            + ". Call propose_decision again and include ALL ten keys as arguments: "
+            + ", ".join(CANDIDATE_FIELDS)
+            + "."
+        )
+    differences = rejection.get("differences") or []
+    if rejection.get("kind") == "disagreement" and differences:
+        lines = [
+            f"- {item.get('field')}: you proposed {item.get('candidate')!r}, "
+            f"the ledger computes {item.get('final')!r}"
+            for item in differences[:6]
+        ]
+        return (
+            "That proposal does not match the computed ledger:\n"
+            + "\n".join(lines)
+            + "\nCall get_cashflow_projection again, read the amounts and dates it "
+            "returns, and resubmit all ten fields with those values. Keep your own "
+            "one-or-two-sentence rationale, citing only numbers the tool output shows."
+        )
+    return (
+        "That proposal was rejected ("
+        + str(rejection.get("detail") or "unknown reason")
+        + "). Re-read the tool output and resubmit all ten fields."
+    )
+
+
+def _context_facts(context: dict) -> tuple[tuple, tuple]:
+    """Amounts and dates the model legitimately saw, for the claim check."""
+    request = context.get("request") if isinstance(context, dict) else None
+    if not isinstance(request, dict):
+        request = {}
+    amounts = tuple(
+        value
+        for value in (request.get("requested_amount"),)
+        if value not in (None, "")
+    )
+    dates = tuple(
+        value
+        for value in (
+            request.get("request_date"),
+            request.get("desired_completion_date"),
+        )
+        if value not in (None, "")
+    )
+    return amounts, dates
+
+
+def _record_repair(state, rejection, trace, enabled) -> None:
+    """Keep the repair attempt in the trace so a run can be audited later."""
+    entry = {"attempt": len(state.get("repair_log") or []) + 1, **rejection}
+    state.setdefault("repair_log", []).append(entry)
+    if enabled and trace is not None:
+        try:
+            trace.record("rejection", entry)
+        except Exception:  # observability never breaks the request
+            pass
 
 
 def _missing_steps(state) -> list[str]:
@@ -1208,7 +1468,14 @@ def run_agent_once(
             {"candidate": candidate_payload, "provider_error": provider_error},
         )
 
-    outcome = enforce_decision(proposal, kernel_result, request_context=context)
+    amounts, dates = _context_facts(context)
+    outcome = enforce_decision(
+        proposal,
+        kernel_result,
+        request_context=context,
+        extra_numbers=amounts,
+        extra_dates=dates,
+    )
     verification = outcome["verification"]
     final_row = outcome["final_row"]
     if enabled:

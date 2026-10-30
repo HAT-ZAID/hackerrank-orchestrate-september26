@@ -1468,13 +1468,37 @@ class TUI:
             return
         from code.task_agent import Workspace, run_task
 
+        provider = None
+        try:
+            from code.providers import build_provider
+
+            provider, provider_reason = build_provider()
+        except Exception as exc:  # offline stays the default
+            provider, provider_reason = None, f"{type(exc).__name__}: {exc}"
+        if provider is None and provider_reason:
+            self.console.print(
+                f"no model configured ({provider_reason}); classifying with the rules",
+                style="dim",
+            )
         workspace = Workspace(data=data, session=self.session)
-        result = run_task(instruction, workspace=workspace, trace_dir=self.task_trace_dir)
+        result = run_task(
+            instruction,
+            workspace=workspace,
+            trace_dir=self.task_trace_dir,
+            provider=provider,
+        )
         # The task engine solves through the same kernel, so keep the TUI's
         # per-request cache hot with what it just computed.
         self._cache.update(workspace._cache)
         for index, step in enumerate(result.steps, start=1):
             label = f"[{index}/{len(result.steps)}] {step.kind}"
+            reading = (step.data or {}).get("intent") or {}
+            if reading.get("intent"):
+                label += (
+                    f"  (intent: {reading.get('intent')}, "
+                    f"{reading.get('request_kind', 'ambiguous')} via "
+                    f"{reading.get('source', 'deterministic_fallback')})"
+                )
             style = {
                 "ok": "green",
                 "refused": "yellow",
