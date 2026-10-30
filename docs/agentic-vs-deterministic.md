@@ -1,33 +1,37 @@
 # Agentic vs deterministic decisions
 
-Provider: `ollama:qwen3-vl:2b-instruct-q4_K_M`
-Requests compared: **3** (first 3 in dataset order)
+Provider: `ollama:llama3.2:3b`
+Requests compared: **5** (first 5 in dataset order)
 
 ## Guardrail
 
-- Machine fields identical: **3/3**
-- Verifier rewrote the explanation from the model's rationale: **0/3**
-- Agent fallbacks: **3/3**
+- Machine fields identical: **5/5**
+- Verifier rewrote the explanation from the model's rationale: **0/5**
+- Agent fallbacks: **5/5**
 
 ## Cost
 
-- Model calls: **18** (6.0 per request)
-- Tool calls: **17** (5.7 per request)
-- Wall clock per request: mean **74.80s**, max **135.36s**
+- Model calls: **9** (1.8 per request)
+- Tool calls: **6** (1.2 per request)
+- Wall clock per request: mean **160.56s**, max **180.73s**
 
 ## Per request
 
 | request | machine fields | explanation | rationale | fallback | model calls | tool calls | seconds |
 |---|---|---|---|---|---|---|---|
-| request_26 | identical | kernel text | kernel | provider call budget exhausted (6/6 turns) | 6 | 6 | 135.36 |
-| request_27 | identical | kernel text | kernel | provider call budget exhausted (6/6 turns) | 6 | 5 | 18.531 |
-| request_28 | identical | kernel text | kernel | provider call budget exhausted (6/6 turns) | 6 | 6 | 70.516 |
+| request_26 | identical | kernel text | kernel | propose_decision failed twice: candidate rejected: missing fields: amount_safe_to_pay, confidence, rationale, request_id; unexpected fields: spending_changes | 5 | 6 | 80.297 |
+| request_27 | identical | kernel text | kernel | provider timeout: provider did not answer within 180s | 1 | 0 | 180.438 |
+| request_28 | identical | kernel text | kernel | provider timeout: provider did not answer within 180s | 1 | 0 | 180.625 |
+| request_29 | identical | kernel text | kernel | provider timeout: provider did not answer within 180s | 1 | 0 | 180.704 |
+| request_30 | identical | kernel text | kernel | provider timeout: provider did not answer within 180s | 1 | 0 | 180.734 |
 
 ## Fallback reasons
 
-- `request_26`: provider call budget exhausted (6/6 turns)
-- `request_27`: provider call budget exhausted (6/6 turns)
-- `request_28`: provider call budget exhausted (6/6 turns)
+- `request_26`: propose_decision failed twice: candidate rejected: missing fields: amount_safe_to_pay, confidence, rationale, request_id; unexpected fields: spending_changes
+- `request_27`: provider timeout: provider did not answer within 180s
+- `request_28`: provider timeout: provider did not answer within 180s
+- `request_29`: provider timeout: provider did not answer within 180s
+- `request_30`: provider timeout: provider did not answer within 180s
 
 ## Reading this
 
