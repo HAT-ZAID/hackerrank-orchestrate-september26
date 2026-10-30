@@ -201,7 +201,8 @@ Full table: [`docs/ocr-comparison.md`](ocr-comparison.md).
 ## 6. Agentic vs non-agentic
 
 *(run 1: `llama3.2:3b`, 5 requests, shipped 6-turn budget, §6.1. Run 2: same
-model, 600 s per-call timeout, §6.4.)*
+model, 600 s per-call timeout, §6.4. Run 3: `gemma4:e2b-it-qat`, before and after
+the flat proposal schema, §6.5.)*
 
 The point of the experiment is not "is the LLM smarter". It is: **does adding an
 LLM loop change any number the user acts on?** If it does, that is a bug.
@@ -286,6 +287,72 @@ unmeasured rows above first looked like "silent successes". A crash now prints t
 request id and the error frame to stderr and is recorded in
 `usage["agent_loop_errors"]`, so the comparison report has a `Crashed agent
 invocations` section instead of a wall of blanks.
+
+### 6.5 Run 3: a better model, and the bug that was our own
+
+If the 3B model was failing at the *shape* of the answer rather than at the
+judgement, then the right next experiment is a model that is better at tool calls,
+not a model with more patience. `gemma4:e2b-it-qat` (2.3B dense, native function
+calling, 3.3 GB) fits this laptop's 3.4 GB of usable VRAM and runs fully on the
+GPU through Vulkan, so it was the natural candidate.
+
+The first run on it was better and still useless:
+
+| Metric | Gemma 4, nested schema |
+|---|---|
+| Machine fields identical to the kernel | **3/3** |
+| Explanations rewritten | 0/3 |
+| Requests that fell back | 3/3 |
+| Model calls (total / per request) | 14 / 4.7 |
+| Wall clock (mean / max) | 92.2 s / 103.7 s |
+
+Every fallback named the same shape failure: `propose_decision` was missing
+`amount_safe_to_pay`, `confidence`, `rationale`, `request_id`, and carried an
+unexpected `spending_changes`. Isolated probes of the same model produced
+perfectly valid vision JSON and a valid tool call with complete arguments, so the
+model was not simply incompetent. That contradiction was worth chasing instead of
+adding more timeout.
+
+**What was actually wrong.** The tool definition asked the model to fill one
+nested object: `propose_decision({"candidate": {…ten fields…}})`. Capturing the raw
+arguments the model sent showed it filled exactly six fields on both attempts, and
+the six it kept were the ones with an enum or a boolean behind them. The four it
+dropped were the free-form ones held *one level inside* the wrapper. A control
+probe posting the same tool schemas straight to Ollama, with no LangChain in
+between, returned complete, correctly typed arguments — so the adapter was
+innocent. The nesting was the loss point.
+
+**The fix, and what it deliberately did not do.** The proposal is now passed as ten
+flat top-level arguments (nested payloads still parse, so nothing regressed),
+every field carries a description and a format hint, the rejection reply now names
+the exact keys that were missing instead of repeating the same generic sentence,
+and the local provider exposes sampling knobs (`BUY_WAIT_OLLAMA_TEMPERATURE`,
+`NUM_CTX`, `TOP_P`, `TOP_K`, `REPEAT_PENALTY`, `NUM_PREDICT`) with reproducible
+defaults. What did **not** change is the validator: it still demands all ten fields
+with the exact types. Loosening it would have turned the one component that
+protects the user into a rubber stamp.
+
+| Metric | Gemma 4, flat schema |
+|---|---|
+| Machine fields identical to the kernel | **3/3** |
+| Explanations rewritten | 0/3 |
+| Requests that fell back | 3/3 — all *verifier disagreements*, zero schema rejections |
+| Model calls (total / per request) | 11 / 3.7 |
+| Wall clock (mean / max) | 71.5 s / 84.6 s |
+
+**The honest reading.** The wall moved. Before the fix the model could not produce
+the artefact at all; afterwards it produced a well-formed proposal on all three
+requests, and the verifier overruled it on substance — disagreeing about
+`payment_plan` and `earliest_date_for_full_payment` on two requests and about
+`recommended_payment_method` on the third. That is a different and much healthier
+failure: the loop is now doing agentic work end to end, and the deterministic judge
+is catching an analyst that is confidently wrong about the schedule. Model calls
+dropped from 14 to 11 and wall clock by 23 % simply because nothing is wasted
+re-submitting a payload that will be rejected.
+
+The lesson worth carrying: at 2–3B parameters, **tool-schema ergonomics matter more
+than model size**. A wrapper key that looks tidy to a human is a lossy pipe for a
+small model, and no amount of timeout compensates.
 
 ---
 
@@ -399,13 +466,17 @@ silent-failure bug in §6.4 was still live; this one would have caught it.
 3. **Handwriting.** One unreadable receipt forces a whole request to
    `not_affordable`. A human-in-the-loop confirmation would fix it.
 4. **Live model quality is mostly unmeasured.** The 50-call OpenRouter budget has
-   not been spent, and the local 2B model could not finish the agent loop.
+   not been spent. The local models now *do* complete the loop (§6.5), but on three
+   requests, and they were wrong about the plan every time — so there is still no
+   evidence that a strong remote model's proposals would beat the kernel's own row.
 5. **Docker is unverified.** The image definition exists and is checked by tests,
    but it has not been built here because the development machine ran out of disk
    space. Treat the first build as unproven; G5/G6 stay NOT RUN until an archive
    exists.
-6. **The agentic path is measured, not proven.** Three requests ran end to end under
-   a 600 s budget and all three fell back to the kernel. That demonstrates the
+6. **The agentic path is measured, not proven.** Seven requests have now run end to
+   end (three with `llama3.2:3b`, three plus one diagnostic with Gemma 4), and every
+   one of them fell back to the kernel — first because the model could not fill the
+   schema, then because the verifier disagreed with its plan. That demonstrates the
    guardrail, not that a capable remote model would converge — the Kilo/Nemotron path
    is wired and documented but has never been run with real credentials.
 7. **`output.csv` is generated, not golden.** It is now rebuilt from the release run
