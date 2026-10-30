@@ -175,6 +175,24 @@ python -m code.agent --request-id <request_id> --provider ollama --trace-dir tra
 `ollama` is the local default and needs no cloud account. Every run is capped at
 `BUY_WAIT_LLM_MAX_CALLS` provider calls (default 50).
 
+Local generation settings are tunable, and the defaults stay reproducible
+(`temperature=0`, `num_ctx=8192`):
+
+```bash
+export BUY_WAIT_OLLAMA_TEMPERATURE=0.0     # raise to explore different wording
+export BUY_WAIT_OLLAMA_NUM_CTX=8192
+export BUY_WAIT_OLLAMA_TOP_P=0.9           # optional; omitted unless set
+export BUY_WAIT_OLLAMA_TOP_K=40
+export BUY_WAIT_OLLAMA_REPEAT_PENALTY=1.1
+export BUY_WAIT_OLLAMA_NUM_PREDICT=1024
+```
+
+Sampling can change what the model *says*, never what the answer *is*: the seven
+machine-readable columns always come from the kernel, and a proposal that
+disagrees with the kernel is dropped. `propose_decision` takes the ten candidate
+fields as flat tool arguments — small local models drop free-form fields when the
+payload is nested under a single wrapper key, so the schema is flat on purpose.
+
 ### 6. Optional: Kilo + Nemotron Ultra deployment
 
 The deployment provider is Kilo's OpenAI-compatible endpoint serving

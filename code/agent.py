@@ -107,10 +107,14 @@ Hard rules:
 - Call search_evidence with a short factual query before deciding.
 - Call get_cashflow_projection for the base state (and for any spending-change
   set you want to propose) before deciding.
-- Finish by calling propose_decision exactly once with the full candidate object.
-  Do not answer with prose only.
+- Finish by calling propose_decision exactly once. Put the ten contract fields
+  DIRECTLY in the tool arguments (no wrapper object). An argument set that omits
+  any of the ten is rejected and wastes a turn. Do not answer with prose only.
+  Every field is always present, even when its value is "none" or "".
 
-Output contract (values must be exact):
+Output contract (values must be exact; send all ten keys):
+- request_id: the request id you were given, copied verbatim
+- amount_safe_to_pay: decimal string between 0 and the requested amount, from get_cashflow_projection
 - affordability_status: {", ".join(AFFORDABILITY_STATUSES)}
 - recommended_payment_method: {", ".join(PAYMENT_METHODS)}
 - payment_plan: "none" or "YYYY-MM-DD:amount" legs joined by "|"
@@ -119,30 +123,66 @@ Output contract (values must be exact):
   stop:<event_id> / reduce_to:<event_id>:<amount>, joined by "|"
 - evidence_sufficient: false only when the not-enough-evidence shape is used
   (safe 0, not_affordable, not_recommended, plan none, no date, no changes).
+- confidence: number between 0 and 1 for your own explanation, not the numbers
+- rationale: one or two sentences grounded in the tool output you saw
 """
 
 CANDIDATE_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "request_id": {"type": "string"},
+        "request_id": {
+            "type": "string",
+            "description": (
+                "The request id taken from get_request_context and copied exactly, "
+                "including the numeric suffix. Never invent or reuse an id from an "
+                "earlier conversation."
+            ),
+        },
         "amount_safe_to_pay": {
             "type": "string",
-            "description": "decimal string between 0 and the requested amount",
+            "description": (
+                "Decimal string between 0 and the requested amount, e.g. \"0\" or "
+                "\"22018.72\". Use the safe_amount from get_cashflow_projection. "
+                "Never a number with a currency symbol or thousands separators."
+            ),
         },
-        "affordability_status": {"type": "string", "enum": list(AFFORDABILITY_STATUSES)},
-        "recommended_payment_method": {"type": "string", "enum": list(PAYMENT_METHODS)},
+        "affordability_status": {
+            "type": "string",
+            "enum": list(AFFORDABILITY_STATUSES),
+            "description": "One exact enum value.",
+        },
+        "recommended_payment_method": {
+            "type": "string",
+            "enum": list(PAYMENT_METHODS),
+            "description": "One exact enum value.",
+        },
         "payment_plan": {
             "type": "string",
-            "description": "'none' or 'YYYY-MM-DD:amount' legs joined by '|'",
+            "description": "'none' or 'YYYY-MM-DD:amount' legs joined by '|', e.g. \"none\"",
         },
-        "earliest_date_for_full_payment": {"type": "string"},
+        "earliest_date_for_full_payment": {
+            "type": "string",
+            "description": "'YYYY-MM-DD' from get_cashflow_projection, or \"\" when none is safe",
+        },
         "spending_changes_needed": {
             "type": "string",
-            "description": "'none' or up to three stop or reduce_to actions joined by '|'",
+            "description": (
+                "'none' or up to three stop:<event_id> / reduce_to:<event_id>:<amount> "
+                "actions joined by '|', e.g. \"none\""
+            ),
         },
-        "evidence_sufficient": {"type": "boolean"},
-        "confidence": {"type": "number"},
-        "rationale": {"type": "string"},
+        "evidence_sufficient": {
+            "type": "boolean",
+            "description": "true unless the not-enough-evidence shape is used.",
+        },
+        "confidence": {
+            "type": "number",
+            "description": "Number between 0 and 1. How sure you are that the rationale matches the tool output.",
+        },
+        "rationale": {
+            "type": "string",
+            "description": "One or two sentences grounded in the tool output. Plain text, no markdown.",
+        },
     },
     "required": list(CANDIDATE_FIELDS),
 }
@@ -218,11 +258,18 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "propose_decision": {
-        "description": "Submit the final candidate. This is the only way to decide.",
+        "description": (
+            "Submit the final decision. Pass the ten contract fields directly as "
+            "arguments (request_id, amount_safe_to_pay, affordability_status, "
+            "recommended_payment_method, payment_plan, "
+            "earliest_date_for_full_payment, spending_changes_needed, "
+            "evidence_sufficient, confidence, rationale). All ten are required on "
+            "every call; an incomplete argument set is rejected."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {"candidate": CANDIDATE_SCHEMA},
-            "required": ["candidate"],
+            "properties": dict(CANDIDATE_SCHEMA["properties"]),
+            "required": list(CANDIDATE_FIELDS),
         },
     },
 }
@@ -852,7 +899,7 @@ def run_agent_loop(
                 _message(
                     "human",
                     "Use the tools. Call search_evidence and get_cashflow_projection, "
-                    "then propose_decision with the full candidate object.",
+                    "then propose_decision with all ten contract fields as arguments.",
                 )
             )
             continue
@@ -927,6 +974,19 @@ def run_agent_loop(
                             "propose_decision failed twice: "
                             + str(envelope.get("error") or "invalid candidate")
                         )
+                    # A small model repeats its own shape unless it is told, in
+                    # plain words, which keys were missing.
+                    messages.append(
+                        _message(
+                            "human",
+                            "That call was rejected: "
+                            + str(envelope.get("error") or "invalid candidate")
+                            + ". Call propose_decision again and include ALL ten "
+                            "keys as arguments: "
+                            + ", ".join(CANDIDATE_FIELDS)
+                            + ".",
+                        )
+                    )
                     continue
                 missing = _missing_steps(state)
                 if missing:

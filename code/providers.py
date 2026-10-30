@@ -30,6 +30,10 @@ Environment:
 ``BUY_WAIT_LLM_MAX_CALLS``    total provider calls per run (default 50)
 ``BUY_WAIT_OLLAMA_MODEL``     local model (default ``qwen2.5:1.5b``)
 ``BUY_WAIT_OLLAMA_BASE_URL``  default ``localhost:11434`` (scheme ``http``)
+``BUY_WAIT_OLLAMA_TEMPERATURE`` sampling temperature (default 0 = reproducible)
+``BUY_WAIT_OLLAMA_NUM_CTX``   context window (default 8192)
+``BUY_WAIT_OLLAMA_NUM_PREDICT``  reply token cap (unset = model default)
+``BUY_WAIT_OLLAMA_TOP_P`` / ``_TOP_K`` / ``_REPEAT_PENALTY``  optional sampling
 ``BUY_WAIT_KILO_BASE_URL``    required: the user's Kilo OpenAI-compatible base URL
 ``BUY_WAIT_KILO_API_KEY``     required: the user's Kilo API key
 ``BUY_WAIT_KILO_MODEL``       default ``nemotron-3-ultra``
@@ -53,6 +57,15 @@ DEFAULT_MAX_CALLS = 50
 OLLAMA_MODEL_ENV = "BUY_WAIT_OLLAMA_MODEL"
 OLLAMA_BASE_URL_ENV = "BUY_WAIT_OLLAMA_BASE_URL"
 DEFAULT_OLLAMA_MODEL = "qwen2.5:1.5b"
+# Generation settings for the local model. Defaults keep a run reproducible;
+# the rest exist because a small model needs context room for the tool schemas.
+OLLAMA_TEMPERATURE_ENV = "BUY_WAIT_OLLAMA_TEMPERATURE"
+OLLAMA_NUM_CTX_ENV = "BUY_WAIT_OLLAMA_NUM_CTX"
+OLLAMA_NUM_PREDICT_ENV = "BUY_WAIT_OLLAMA_NUM_PREDICT"
+OLLAMA_TOP_P_ENV = "BUY_WAIT_OLLAMA_TOP_P"
+OLLAMA_TOP_K_ENV = "BUY_WAIT_OLLAMA_TOP_K"
+OLLAMA_REPEAT_PENALTY_ENV = "BUY_WAIT_OLLAMA_REPEAT_PENALTY"
+DEFAULT_NUM_CTX = 8192
 # Written as two literals: a bare scheme-plus-host string trips the submission's
 # hardcoded-absolute-path gate (it flags any letter-colon-slash pair) even though
 # a URL is not a filesystem path.
@@ -145,6 +158,16 @@ def _int_from_env(env, key: str, default: int, *, minimum: int = 0) -> int:
         return default
 
 
+def _float_from_env(env, key: str, default: float) -> float:
+    raw = env.get(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 class ChatProvider:
     """Base for tool-calling providers: identity, budget and a lazy chat model."""
 
@@ -223,6 +246,37 @@ class OllamaProvider(ChatProvider):
     def model_env_name(cls) -> str:
         return OLLAMA_MODEL_ENV
 
+    def generation_options(self) -> dict:
+        """Sampling and context settings for the local model.
+
+        Temperature stays 0 by default so a run is reproducible; the other knobs
+        are exposed because a small local model needs room for the tool schemas
+        and sometimes a little sampling to stop repeating its own shape.
+        """
+        env = self.env
+        options: dict = {
+            "temperature": _float_from_env(env, OLLAMA_TEMPERATURE_ENV, 0.0),
+            "num_ctx": _int_from_env(env, OLLAMA_NUM_CTX_ENV, DEFAULT_NUM_CTX, minimum=512),
+        }
+        for key, name in (
+            (OLLAMA_TOP_P_ENV, "top_p"),
+            (OLLAMA_TOP_K_ENV, "top_k"),
+            (OLLAMA_REPEAT_PENALTY_ENV, "repeat_penalty"),
+        ):
+            value = str(env.get(key) or "").strip()
+            if value:
+                try:
+                    options[name] = float(value) if name != "top_k" else int(float(value))
+                except ValueError:
+                    continue
+        predict = str(env.get(OLLAMA_NUM_PREDICT_ENV) or "").strip()
+        if predict:
+            try:
+                options["num_predict"] = int(float(predict))
+            except ValueError:
+                pass
+        return options
+
     def chat_model(self):
         if not self.model:
             raise ProviderUnavailable(
@@ -235,7 +289,9 @@ class OllamaProvider(ChatProvider):
                 f"langchain-ollama is not installed: {exc}"
             ) from exc
         try:
-            return ChatOllama(model=self.model, base_url=self.base_url, temperature=0)
+            return ChatOllama(
+                model=self.model, base_url=self.base_url, **self.generation_options()
+            )
         except Exception as exc:
             raise ProviderUnavailable(
                 f"cannot create ChatOllama model {self.model!r}: {type(exc).__name__}: {exc}"
