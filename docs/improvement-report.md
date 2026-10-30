@@ -200,7 +200,7 @@ Full table: [`docs/ocr-comparison.md`](ocr-comparison.md).
 
 ## 6. Agentic vs non-agentic
 
-*(numbers filled in after the final run — see §6.1)*
+*(run 1: `llama3.2:3b`, 5 requests, 6-turn budget, details in §6.1)*
 
 The point of the experiment is not "is the LLM smarter". It is: **does adding an
 LLM loop change any number the user acts on?** If it does, that is a bug.
@@ -209,25 +209,34 @@ LLM loop change any number the user acts on?** If it does, that is a bug.
 
 | Metric | Result |
 |---|---|
-| Machine fields identical to the kernel | `TBD` |
-| Explanations rewritten by the analyst | `TBD` |
-| Requests that fell back to the kernel | `TBD` |
-| Model calls (total / per request) | `TBD` |
-| Wall clock (mean / max) | `TBD` |
+| Machine fields identical to the kernel | **5/5** |
+| Explanations rewritten by the analyst | 0/5 |
+| Requests that fell back to the kernel | 5/5 |
+| Model calls (total / per request) | 9 / 1.8 |
+| Wall clock (mean / max) | 160.6 s / 180.7 s |
+
+An earlier smoke run with `qwen3-vl:2b-instruct` (3 requests, same budget)
+behaved the same way: machine fields identical 3/3, every request fell back.
 
 ### 6.2 The uncomfortable finding
 
-The first run used `qwen3-vl:2b-instruct` as the *agent* rather than as a reader.
-It called tools — 17 tool calls over 3 requests — and then **ran out of its
-6-turn budget without proposing a decision**, three times out of three.
+The agent loop ran on `llama3.2:3b`, a genuinely tool-capable chat model. It
+explored — fetched context, projections, payment options — and one attempt even
+produced a `propose_decision`, which the **schema validator rejected** because it
+was missing required fields (`amount_safe_to_pay`, `confidence`, `rationale`,
+`request_id`) and had an unexpected one (`spending_changes`). It then ran out of
+its 6-turn budget. Four of the five requests timed out at 180 s of CPU inference
+before finishing their plan at all.
 
-That is a useful result, not a failure to hide: a 2B vision model is a reader, not
-a planner. It can say what a receipt contains; it cannot hold a multi-step plan,
-choose which evidence to fetch, and converge on a proposal inside a bounded budget.
+That is a useful result, not a failure to hide: a 2–3B local model is a reader,
+not a planner. It can say what a receipt contains; it cannot hold a multi-step
+plan, choose which evidence to fetch, and converge on a typed proposal inside a
+bounded budget on this hardware.
 
-The honest options are (a) raise the turn budget and accept the latency, (b) use a
-larger tool-capable model, or (c) keep the loop for explanation and let the kernel
-do the planning — which is what the product does by default.
+The honest options are (a) raise the turn budget and timeout and accept the
+latency (the 600 s / 10-turn rerun is planned, results will be appended), (b) use
+a larger tool-capable model, or (c) keep the loop for explanation and let the
+kernel do the planning — which is what the product does by default.
 
 ### 6.3 Why the fallback is a feature
 

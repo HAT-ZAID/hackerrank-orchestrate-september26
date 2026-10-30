@@ -229,7 +229,7 @@ def main(argv=None) -> int:
         "--image-dir", default=None,
         help="image directory (default <repo>/dataset/media/images)",
     )
-    parser.add_argument("--backend", choices=BACKEND_CHOICES, default="both")
+    parser.add_argument("--backend", default="both", help="tesseract, vlm, docling, auto, both, or a comma-separated list")
     parser.add_argument("--limit", type=int, default=None, help="only the first N linked images")
     parser.add_argument("--no-cache", action="store_true", help="ignore and do not write the OCR cache")
     parser.add_argument("--out", default=None, help="write the Markdown report here")
@@ -241,7 +241,14 @@ def main(argv=None) -> int:
     if not image_dir.is_dir():
         print(f"image directory not found: {image_dir}", file=sys.stderr)
         return 2
-    backends = COMPARE_SET if args.backend == "both" else (args.backend,)
+    backends = COMPARE_SET if args.backend == "both" else (
+        tuple(s.strip() for s in str(args.backend).split(",") if s.strip())
+        if "," in args.backend
+        else (args.backend,)
+    )
+    unknown = [name for name in backends if name not in BACKEND_CHOICES]
+    if not backends or unknown:
+        parser.error(f"--backend must be one or more of {', '.join(BACKEND_CHOICES)}; got {args.backend!r}")
 
     result = compare(root, image_dir, backends, limit=args.limit, use_cache=not args.no_cache)
     if not result["rows"]:

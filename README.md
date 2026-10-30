@@ -73,6 +73,7 @@ machine, never in the cloud.
 | `docling` | IBM Docling layout-aware markdown, run in its own interpreter | `BUY_WAIT_DOCLING_PYTHON` |
 | `tesseract` | Classic OCR, kept as the comparison and last-resort path | `TESSERACT_CMD` |
 
+
 `BUY_WAIT_OCR_BACKEND=auto` tries Qwen3-VL, then Docling when configured, then
 Tesseract. A model-proposed amount is trusted only when it is positive, in the
 event's currency, and agrees with the deterministic parser reading the same text;
@@ -243,7 +244,11 @@ unproven and report anything it breaks.
   extra coverage here; `image_14` stays unresolved for both. The model did
   propose two wrong amounts (a 40.00 USD receipt and a garbled nine-digit INR
   total), both rejected by the deterministic check, which is why the parser stays
-  the authority — see [`docs/ocr-comparison.md`](./docs/ocr-comparison.md).
+  the authority. A third reader, IBM Docling, resolves 13/16 and agrees with
+  Tesseract on only 7 of those — it loses grand totals on dense, itemised
+  receipts — so it stays an optional third opinion. See
+  [`docs/ocr-comparison.md`](./docs/ocr-comparison.md) and
+  [`docs/docling-vs-tesseract.md`](./docs/docling-vs-tesseract.md).
 - Live model quality is unmeasured. Replay and offline paths are tested; the
   Kilo/Nemotron and Ollama behavior has not been benchmarked in this repository,
   and there is no published latency or cost comparison yet.

@@ -48,3 +48,38 @@ that trusted the model's JSON would have recorded a 1.14 billion rupee pharmacy 
 **Formatting is not disagreement.** `100000.00` and `100000`, or `41272.00` and
 `41272.0`, are the same money. The comparison tool originally compared strings and
 counted five false disagreements; it now compares `Decimal` values.
+
+## The third reader: IBM Docling across all 16 images
+
+Docling ran once over every linked image (`--backend docling`, 600 s timeout, temp
+dirs on D: because its conversion spills through the system temp directory). Full
+table: [`docling-vs-tesseract.md`](docling-vs-tesseract.md).
+
+| Reader | Resolved an amount | Agrees with Tesseract (numeric) |
+|---|---|---|
+| Tesseract | 15/16 | — |
+| Qwen3-VL 2B | 15/16 | 14/15 with Tesseract |
+| IBM Docling | 13/16 | 7/13 with Tesseract |
+
+The three-run cache made the cross-checks free: the final table was produced with
+**32 hits, 0 misses, 0 writes** — no image was re-read to compare three readers.
+
+Where the readers disagree, Tesseract deserves the benefit of doubt for this
+dataset. Its win rate is a property of *these documents*, not a universal ranking:
+
+- The clean, simply-labelled receipts (images 01, 02, 03, 05, 11, 12, 13) agree
+  across all three readers.
+- On dense, itemised receipts Docling's layout-aware markdown loses the total:
+  image_04 `376` vs `2854.00`, image_06 `84` vs `1995.00`, image_08 `6455` vs `15339`,
+  image_09 `6320` vs `723.00`, image_15 `48` vs `9968.00`. These look like Docling
+  reconciling subtotals instead of the grand total.
+- image_07 is a near-miss (`8528` vs `8528.10` — paise lost in Docling's conversion).
+- On images 10 and 16 Docling finds no labelled amount where Tesseract reads one
+  (`79679.26`, `393.22`); image_14 (handwriting) still defeats every reader.
+
+Practical conclusion kept for the product: `auto` still prefers the VLM, and the
+deterministic labelled-amount parser over Tesseract text remains the tie-breaker.
+Docling earns its slot as a configured, optional third opinion — chosen with
+`BUY_WAIT_OCR_BACKEND=docling` or `BUY_WAIT_OCR_BACKEND=auto` plus
+`BUY_WAIT_DOCLING_PYTHON` — and the pipeline's agreement requirement means a bad
+Docling read can never silently change an amount.
